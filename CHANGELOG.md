@@ -1,5 +1,11 @@
 # Changelog
 
+
+## 1.0.20
+
+- Fix: reduce auto-capture noise by skipping memory-management prompts (delete/forget/cleanup memory entries).
+- Improve: broaden English decision triggers so statements like "we decided / going forward we will use" are captured as decisions.
+
 ## 1.0.19
 
 - UX: show memory IDs in `memory-pro list` and `memory-pro search` output, so users can delete entries without switching to JSON.

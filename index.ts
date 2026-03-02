@@ -107,6 +107,7 @@ const MEMORY_TRIGGERS = [
   /zapamatuj si|pamatuj|remember/i,
   /preferuji|radši|nechci|prefer/i,
   /rozhodli jsme|budeme používat/i,
+  /\b(we )?decided\b|we'?ll use|we will use|switch(ed)? to|migrate(d)? to|going forward|from now on/i,
   /\+\d{10,}/,
   /[\w.-]+@[\w.-]+\.\w+/,
   /můj\s+\w+\s+je|je\s+můj/i,
@@ -123,31 +124,47 @@ const MEMORY_TRIGGERS = [
   /幫我|筆記|存檔|存起來|存一下|重點|原則|底線/,
 ];
 
+const CAPTURE_EXCLUDE_PATTERNS = [
+  // Memory management / meta-ops: do not store as long-term memory
+  /\b(memory-pro|memory_store|memory_recall|memory_forget|memory_update)\b/i,
+  /\bopenclaw\s+memory-pro\b/i,
+  /\b(delete|remove|forget|purge|cleanup|clean up|clear)\b.*\b(memory|memories|entry|entries)\b/i,
+  /\b(memory|memories)\b.*\b(delete|remove|forget|purge|cleanup|clean up|clear)\b/i,
+  /\bhow do i\b.*\b(delete|remove|forget|purge|cleanup|clear)\b/i,
+  /(删除|刪除|清理|清除).{0,12}(记忆|記憶|memory)/i,
+];
+
+
 export function shouldCapture(text: string): boolean {
+  const s = text.trim();
+
   // CJK characters carry more meaning per character, use lower minimum threshold
-  const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(text);
+  const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(s);
   const minLen = hasCJK ? 4 : 10;
-  if (text.length < minLen || text.length > 500) {
+  if (s.length < minLen || s.length > 500) {
     return false;
   }
   // Skip injected context from memory recall
-  if (text.includes("<relevant-memories>")) {
+  if (s.includes("<relevant-memories>")) {
     return false;
   }
   // Skip system-generated content
-  if (text.startsWith("<") && text.includes("</")) {
+  if (s.startsWith("<") && s.includes("</")) {
     return false;
   }
   // Skip agent summary responses (contain markdown formatting)
-  if (text.includes("**") && text.includes("\n-")) {
+  if (s.includes("**") && s.includes("\n-")) {
     return false;
   }
   // Skip emoji-heavy responses (likely agent output)
-  const emojiCount = (text.match(/[\u{1F300}-\u{1F9FF}]/gu) || []).length;
+  const emojiCount = (s.match(/[\u{1F300}-\u{1F9FF}]/gu) || []).length;
   if (emojiCount > 3) {
     return false;
   }
-  return MEMORY_TRIGGERS.some((r) => r.test(text));
+  // Exclude obvious memory-management prompts
+  if (CAPTURE_EXCLUDE_PATTERNS.some((r) => r.test(s))) return false;
+
+  return MEMORY_TRIGGERS.some((r) => r.test(s));
 }
 
 export function detectCategory(text: string): "preference" | "fact" | "decision" | "entity" | "other" {
@@ -155,7 +172,7 @@ export function detectCategory(text: string): "preference" | "fact" | "decision"
   if (/prefer|radši|like|love|hate|want|偏好|喜歡|喜欢|討厭|讨厌|不喜歡|不喜欢|愛用|爱用|習慣|习惯/i.test(lower)) {
     return "preference";
   }
-  if (/rozhodli|decided|will use|budeme|決定|决定|選擇了|选择了|改用|換成|换成|以後用|以后用|規則|流程|SOP/i.test(lower)) {
+  if (/rozhodli|decided|we decided|will use|we will use|we'?ll use|switch(ed)? to|migrate(d)? to|going forward|from now on|budeme|決定|决定|選擇了|选择了|改用|換成|换成|以後用|以后用|規則|流程|SOP/i.test(lower)) {
     return "decision";
   }
   if (/\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se|我的\S+是|叫我|稱呼|称呼/i.test(lower)) {

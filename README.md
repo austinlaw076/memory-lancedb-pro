@@ -155,6 +155,7 @@ Filters out low-quality content at both auto-capture and tool-store stages:
 ### 8. Auto-Capture & Auto-Recall
 
 - **Auto-Capture** (`agent_end` hook): Extracts preference/fact/decision/entity from conversations, deduplicates, stores up to 3 per turn
+  - Skips memory-management prompts (e.g. delete/forget/cleanup memory entries) to reduce noise
 - **Auto-Recall** (`before_agent_start` hook): Injects `<relevant-memories>` context (up to 3 entries)
 
 ### Prevent memories from showing up in replies
