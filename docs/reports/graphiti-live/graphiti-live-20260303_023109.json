@@ -1,0 +1,67 @@
+{
+  "timestamp": "2026-03-03T02:31:09.643Z",
+  "environment": {
+    "node": "v25.6.1",
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "config": {
+    "baseUrl": "http://localhost:8000",
+    "hasToken": false,
+    "timeoutMs": 5000,
+    "scope": "global",
+    "query": "project timeline and owner preferences"
+  },
+  "steps": [
+    {
+      "name": "health_probe",
+      "ok": false,
+      "details": [
+        {
+          "url": "http://localhost:8000/health",
+          "ok": false,
+          "status": 404,
+          "bodySnippet": "Not Found",
+          "latencyMs": 50
+        },
+        {
+          "url": "http://localhost:8000/api/health",
+          "ok": false,
+          "status": 404,
+          "bodySnippet": "Not Found",
+          "latencyMs": 4
+        },
+        {
+          "url": "http://localhost:8000/status",
+          "ok": false,
+          "status": 404,
+          "bodySnippet": "Not Found",
+          "latencyMs": 2
+        }
+      ],
+      "warning": "No health endpoint returned 2xx. This may be acceptable if /mcp is reachable."
+    },
+    {
+      "name": "mcp_tools_list",
+      "ok": false,
+      "authRequired": true,
+      "endpoint": "http://localhost:8000/mcp",
+      "attempts": [
+        {
+          "url": "http://localhost:8000/mcp",
+          "ok": false,
+          "status": 401,
+          "authRequired": true,
+          "latencyMs": 7,
+          "bodySnippet": "{\"error\": \"invalid_token\", \"error_description\": \"Authentication required\"}"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "status": "blocked_auth",
+    "notes": [
+      "Graphiti MCP endpoint requires authentication. Set GRAPHITI_API_TOKEN and rerun."
+    ]
+  }
+}
