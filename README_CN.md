@@ -394,7 +394,7 @@ openclaw config get plugins.slots.memory
 | 提供商 | 模型 | Base URL | 维度 |
 |--------|------|----------|------|
 | **Jina**（推荐） | `jina-embeddings-v5-text-small` | `https://api.jina.ai/v1` | 1024 |
-| **OpenAI** | `text-embedding-3-small` | `https://api.openai.com/v1` | 1536 |
+| **OpenAI** | `text-embedding-3-large` | `https://api.openai.com/v1` | 3072 |
 | **Google Gemini** | `gemini-embedding-001` | `https://generativelanguage.googleapis.com/v1beta/openai/` | 3072 |
 | **Ollama**（本地） | `nomic-embed-text` | `http://localhost:11434/v1` | _与本地模型输出一致_（建议显式设置 `embedding.dimensions`） |
 

@@ -392,7 +392,7 @@ const memoryLanceDBProPlugin = {
     }
 
     const vectorDim = getVectorDimensions(
-      config.embedding.model || "text-embedding-3-small",
+      config.embedding.model || "text-embedding-3-large",
       config.embedding.dimensions,
     );
 
@@ -401,7 +401,7 @@ const memoryLanceDBProPlugin = {
     const embedder = createEmbedder({
       provider: "openai-compatible",
       apiKey: config.embedding.apiKey,
-      model: config.embedding.model || "text-embedding-3-small",
+      model: config.embedding.model || "text-embedding-3-large",
       baseURL: config.embedding.baseURL,
       dimensions: config.embedding.dimensions,
       taskQuery: config.embedding.taskQuery,
@@ -440,7 +440,7 @@ const memoryLanceDBProPlugin = {
     const turnCounter = new Map<string, number>();
 
     api.logger.info(
-      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
+      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-large"})`,
     );
 
     if (graphitiBridge) {
@@ -1065,7 +1065,7 @@ function parsePluginConfig(value: unknown): PluginConfig {
       model:
         typeof embedding.model === "string"
           ? embedding.model
-          : "text-embedding-3-small",
+          : "text-embedding-3-large",
       baseURL:
         typeof embedding.baseURL === "string"
           ? resolveEnvVars(embedding.baseURL)

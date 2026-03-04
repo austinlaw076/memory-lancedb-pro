@@ -376,8 +376,8 @@
     },
     "embedding.model": {
       "label": "Embedding Model",
-      "placeholder": "text-embedding-3-small",
-      "help": "Embedding model name (e.g. text-embedding-3-small, gemini-embedding-001, nomic-embed-text)"
+      "placeholder": "text-embedding-3-large",
+      "help": "Embedding model name (e.g. text-embedding-3-large, gemini-embedding-001, nomic-embed-text)"
     },
     "embedding.baseURL": {
       "label": "Base URL",
