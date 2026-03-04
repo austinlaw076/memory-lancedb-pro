@@ -4,7 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const ENV = {
-  baseUrl: process.env.GRAPHITI_BASE_URL?.trim() || "http://localhost:8000",
+  baseUrl: process.env.GRAPHITI_BASE_URL?.trim() || "http://localhost:8001",
   token: process.env.GRAPHITI_API_TOKEN?.trim() || "",
   timeoutMs: parsePositiveInt(process.env.GRAPHITI_TIMEOUT_MS, 5000),
   scope: process.env.GRAPHITI_SCOPE?.trim() || "global",
@@ -15,9 +15,9 @@ const ENV = {
 };
 
 const TOOL_CANDIDATES = {
-  addEpisode: ["add_episode", "graphiti_add_episode"],
+  addEpisode: ["add_memory", "add_episode", "graphiti_add_episode"],
   searchNodes: ["search_nodes", "graphiti_search_nodes"],
-  searchFacts: ["search_facts", "graphiti_search_facts"],
+  searchFacts: ["search_memory_facts", "search_facts", "graphiti_search_facts"],
 };
 
 async function main() {
@@ -227,6 +227,13 @@ async function probeMcpTools(baseUrl, token, timeoutMs) {
 async function verifyAddEpisode(baseUrl, token, timeoutMs, toolName, scope, text) {
   const endpoint = `${stripTrailingSlash(baseUrl)}/mcp`;
   const payloads = [
+    {
+      name: `verify-${Date.now()}`,
+      episode_body: text,
+      group_id: scope,
+      source: "text",
+      source_description: "graphiti-live-verify",
+    },
     { group_id: scope, text },
     { groupId: scope, text },
     { group_id: scope, messages: [{ role: "user", content: text }] },
@@ -267,6 +274,7 @@ async function verifyAddEpisode(baseUrl, token, timeoutMs, toolName, scope, text
 async function verifySearchTool(baseUrl, token, timeoutMs, toolName, scope, query, limit, kind) {
   const endpoint = `${stripTrailingSlash(baseUrl)}/mcp`;
   const payloads = [
+    { group_ids: [scope], query, max_facts: limit, max_nodes: limit },
     { group_id: scope, query, limit },
     { groupId: scope, query, limit },
     { group_id: scope, q: query, top_k: limit },
@@ -303,6 +311,51 @@ async function verifySearchTool(baseUrl, token, timeoutMs, toolName, scope, quer
 }
 
 async function mcpCall(endpoint, token, timeoutMs, method, params) {
+  const initPayload = {
+    jsonrpc: "2.0",
+    id: `verify-init-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "verify-graphiti-live", version: "1.0.0" },
+    },
+  };
+
+  const initResult = await request(endpoint, {
+    method: "POST",
+    timeoutMs,
+    token,
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify(initPayload),
+  });
+  const sessionId =
+    initResult.headers?.["mcp-session-id"] ||
+    initResult.headers?.["Mcp-Session-Id"] ||
+    initResult.headers?.["mcp-session-id".toLowerCase()];
+
+  if (!initResult.ok || !sessionId) {
+    return {
+      ok: false,
+      status: initResult.status,
+      latencyMs: initResult.latencyMs,
+      bodyText: initResult.bodyText,
+      authRequired: /invalid_token|Authentication required/i.test(initResult.bodyText || ""),
+    };
+  }
+
+  await request(endpoint, {
+    method: "POST",
+    timeoutMs,
+    token,
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-session-id": sessionId,
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
+  });
+
   const payload = {
     jsonrpc: "2.0",
     id: `verify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -313,16 +366,15 @@ async function mcpCall(endpoint, token, timeoutMs, method, params) {
     method: "POST",
     timeoutMs,
     token,
-    headers: { "content-type": "application/json", accept: "application/json" },
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-session-id": sessionId,
+    },
     body: JSON.stringify(payload),
   });
 
-  let parsed;
-  try {
-    parsed = result.bodyText ? JSON.parse(result.bodyText) : undefined;
-  } catch {
-    parsed = undefined;
-  }
+  const parsed = parseMcpResponse(result.bodyText);
 
   const authRequired =
     parsed?.error === "invalid_token" ||
@@ -360,6 +412,26 @@ async function mcpCall(endpoint, token, timeoutMs, method, params) {
   };
 }
 
+function parseMcpResponse(bodyText) {
+  if (!bodyText) return undefined;
+  try {
+    return JSON.parse(bodyText);
+  } catch {
+    // noop
+  }
+  const lines = String(bodyText).split("\n");
+  for (const line of lines) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    try {
+      return JSON.parse(payload);
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
 async function request(url, options) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
@@ -381,6 +453,7 @@ async function request(url, options) {
       status: response.status,
       bodyText,
       latencyMs: Date.now() - started,
+      headers: Object.fromEntries(response.headers.entries()),
     };
   } catch (err) {
     return {
@@ -491,7 +564,7 @@ function extractStructuredPayload(result) {
   }
   const record = result;
   if (record.structuredContent && typeof record.structuredContent === "object") {
-    return record.structuredContent;
+    return unwrapCommonEnvelope(record.structuredContent);
   }
   if (Array.isArray(record.content)) {
     for (const block of record.content) {
@@ -499,7 +572,7 @@ function extractStructuredPayload(result) {
         try {
           const parsed = JSON.parse(block.text);
           if (parsed && typeof parsed === "object") {
-            return parsed;
+            return unwrapCommonEnvelope(parsed);
           }
         } catch {
           continue;
@@ -507,7 +580,7 @@ function extractStructuredPayload(result) {
       }
     }
   }
-  return record;
+  return unwrapCommonEnvelope(record);
 }
 
 function estimateResultCount(result, kind) {
@@ -519,6 +592,38 @@ function estimateResultCount(result, kind) {
     }
   }
   return 0;
+}
+
+function unwrapCommonEnvelope(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  let cursor = value;
+  const visited = new Set();
+  while (!visited.has(cursor)) {
+    visited.add(cursor);
+
+    if (hasArrayKeys(cursor, ["nodes", "facts", "items", "results", "data"])) {
+      return cursor;
+    }
+
+    const nested = cursor.result;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      cursor = nested;
+      continue;
+    }
+    return cursor;
+  }
+  return cursor;
+}
+
+function hasArrayKeys(payload, keys) {
+  for (const key of keys) {
+    if (Array.isArray(payload[key])) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function snippet(text) {
