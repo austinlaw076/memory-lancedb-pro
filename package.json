@@ -35,7 +35,7 @@
     ]
   },
   "scripts": {
-    "test": "node test/cli-smoke.mjs && node test/graphiti-smoke.mjs",
+    "test": "node test/embedder-error-hints.test.mjs && node test/cli-smoke.mjs && node test/graphiti-smoke.mjs",
     "verify:graphiti-live": "node scripts/verify-graphiti-live.mjs"
   },
   "devDependencies": {
