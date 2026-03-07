@@ -105,6 +105,17 @@ function parsePositiveInt(value: unknown): number | undefined {
   return undefined;
 }
 
+function isLocalEmbeddingBaseUrl(raw: string | undefined): boolean {
+  if (!raw || raw.trim().length === 0) return false;
+  try {
+    const parsed = new URL(raw.trim());
+    const host = parsed.hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch {
+    return false;
+  }
+}
+
 function parseBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") {
     return value;
@@ -1002,7 +1013,22 @@ function parsePluginConfig(value: unknown): PluginConfig {
     // apiKey is present but wrong type — throw, don't silently fall back
     throw new Error("embedding.apiKey must be a string or non-empty array of strings");
   } else {
-    apiKey = process.env.OPENAI_API_KEY || "";
+    const envKey = process.env.OPENAI_API_KEY;
+    if (envKey) {
+      apiKey = envKey;
+    } else if (
+      isLocalEmbeddingBaseUrl(
+        typeof embedding.baseURL === "string" ? resolveEnvVars(embedding.baseURL) : undefined,
+      )
+    ) {
+      apiKey = "no-key-required";
+      console.warn(
+        "[memory-lancedb-pro] No embedding.apiKey configured and OPENAI_API_KEY env var not set. " +
+          "Using a dummy key for local embedding endpoint. Set embedding.apiKey for cloud endpoints.",
+      );
+    } else {
+      throw new Error("embedding.apiKey is required (set directly or via OPENAI_API_KEY env var)");
+    }
   }
 
   if (!apiKey || (Array.isArray(apiKey) && apiKey.length === 0)) {
