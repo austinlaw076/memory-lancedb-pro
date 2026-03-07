@@ -84,10 +84,19 @@ function formatSearchResults(execution: RetrievalExecution, debug: boolean): str
     if (result.sources.bm25) sources.push("BM25");
     if (result.sources.reranked) sources.push("reranked");
 
-    return (
+    let line =
       `${i + 1}. [${result.entry.id}] [${result.entry.category}:${result.entry.scope}] ${result.entry.text} ` +
-      `(${(result.score * 100).toFixed(0)}%, ${sources.join("+")})`
-    );
+      `(${(result.score * 100).toFixed(0)}%, ${sources.join("+")})`;
+
+    // Per-result score trail (debug only)
+    if (debug && result.scoreHistory && result.scoreHistory.length > 0) {
+      const trail = result.scoreHistory
+        .map((s) => `${s.stage}=${(s.score * 100).toFixed(0)}%`)
+        .join(" → ");
+      line += `\n   scores: ${trail}`;
+    }
+
+    return line;
   });
 
   return debug
@@ -284,6 +293,71 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
       } catch (error) {
         console.error("Reindex failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // Benchmark
+  memory
+    .command("benchmark")
+    .description("Run retrieval benchmark against fixed query fixtures")
+    .option("--json", "Output full JSON report")
+    .option("--jsonl", "Output one JSON line per query")
+    .option("--fixtures <path>", "Path to custom fixtures file")
+    .option("--strict", "Exit with code 2 if any gate fixtures fail")
+    .action(async (options) => {
+      try {
+        const { resolve } = await import("path");
+        const { fileURLToPath } = await import("url");
+
+        // Resolve fixture path: --fixtures flag > default location
+        let fixturesPath: string;
+        if (options.fixtures) {
+          fixturesPath = resolve(options.fixtures);
+        } else {
+          // Try import.meta.url-relative, then __dirname fallback
+          try {
+            const selfDir = fileURLToPath(new URL(".", import.meta.url));
+            fixturesPath = resolve(selfDir, "test/benchmark-fixtures.json");
+          } catch {
+            fixturesPath = resolve(__dirname, "test/benchmark-fixtures.json");
+          }
+        }
+
+        // Load & validate fixtures using shared core
+        const { loadFixtures, runBenchmark, formatBenchmarkText } = await import("./src/benchmark.js") as typeof import("./src/benchmark.js");
+
+        let fixtures;
+        try {
+          fixtures = loadFixtures(fixturesPath);
+        } catch (err) {
+          console.error(`Fixture loading failed: ${err instanceof Error ? err.message : err}`);
+          process.exit(1);
+        }
+
+        console.error(`Fixtures loaded: ${fixtures.length} from ${fixturesPath}`);
+
+        // Run benchmark using shared core
+        const report = await runBenchmark(context.retriever, fixtures, fixturesPath);
+
+        // Output
+        if (options.json) {
+          console.log(JSON.stringify(report, null, 2));
+        } else if (options.jsonl) {
+          for (const entry of report.results) {
+            console.log(JSON.stringify(entry));
+          }
+        } else {
+          console.log(formatBenchmarkText(report));
+        }
+
+        // Exit code
+        if (options.strict && report.summary.gateFail > 0) {
+          console.error(`\n✘ ${report.summary.gateFail} gate fixture(s) failed. Exiting with code 2.`);
+          process.exit(2);
+        }
+      } catch (error) {
+        console.error("Benchmark failed:", error);
         process.exit(1);
       }
     });
