@@ -2353,7 +2353,17 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     throw new Error("embedding.apiKey must be a string or non-empty array of strings");
   } else {
     // No apiKey configured — try env var, then fall back to dummy key for local providers (e.g. Ollama)
-    apiKey = process.env.OPENAI_API_KEY || "no-key-required";
+    const envKey = process.env.OPENAI_API_KEY;
+    if (envKey) {
+      apiKey = envKey;
+    } else {
+      apiKey = "no-key-required";
+      console.warn(
+        "[memory-lancedb-pro] No embedding.apiKey configured and OPENAI_API_KEY env var not set. " +
+        "This is fine for local providers (Ollama), but cloud providers (Jina, OpenAI) will fail at runtime. " +
+        "Set embedding.apiKey in plugin config or export OPENAI_API_KEY to fix.",
+      );
+    }
   }
 
   const memoryReflectionRaw = typeof cfg.memoryReflection === "object" && cfg.memoryReflection !== null
