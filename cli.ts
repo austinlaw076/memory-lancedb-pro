@@ -844,6 +844,23 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       : "";
     const limit = clampInt(parseInt(String(options.limit ?? "40"), 10) || 40, 1, 200);
     const dryRun = options.dryRun === true;
+    const syncGraphiti = options.syncGraphiti === true;
+
+    const categoryMapRaw = typeof options.categoryMap === "string"
+      ? options.categoryMap.trim()
+      : "";
+    const categoryMap: Record<string, string> = {};
+    if (categoryMapRaw) {
+      for (const pair of categoryMapRaw.split(",")) {
+        const [key, value] = pair.split("=").map((s) => s.trim());
+        if (key && value) {
+          categoryMap[key] = value;
+        }
+      }
+    }
+
+    const minScore = parseFloat(String(options.minScore ?? "0")) || 0;
+    const minScoreClamped = Math.max(0, Math.min(1, minScore));
 
     const graph = modeRaw === "list"
       ? await context.graphitiBridge.list(scope, limit, limit)
@@ -855,16 +872,24 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         });
 
     const candidates = [
-      ...graph.facts.map((fact) => ({
-        text: fact.text,
-        category: "fact" as const,
-        sourceKind: "fact",
-      })),
-      ...graph.nodes.map((node) => ({
-        text: node.label,
-        category: "entity" as const,
-        sourceKind: "node",
-      })),
+      ...graph.facts
+        .filter((fact) => minScoreClamped === 0 || (fact.score ?? 0) >= minScoreClamped)
+        .map((fact) => ({
+          text: fact.text,
+          category: categoryMap.fact || "fact",
+          sourceKind: "fact",
+          score: fact.score,
+          graphId: fact.id,
+        })),
+      ...graph.nodes
+        .filter((node) => minScoreClamped === 0 || (node.score ?? 0) >= minScoreClamped)
+        .map((node) => ({
+          text: node.label,
+          category: categoryMap.entity || "entity",
+          sourceKind: "node",
+          score: node.score,
+          graphId: node.id,
+        })),
     ]
       .map((row) => ({
         ...row,
@@ -876,6 +901,8 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     let imported = 0;
     let skippedDuplicate = 0;
     let skippedEmpty = 0;
+    let skippedLowScore = 0;
+    let syncedToGraphiti = 0;
 
     for (const row of candidates) {
       if (row.normalized.length < 2) {
@@ -895,10 +922,13 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         continue;
       }
 
+      const importance = row.score != null ? 0.5 + (row.score * 0.5) : 0.62;
+      const confidence = row.score != null ? 0.5 + (row.score * 0.5) : 0.66;
+
       await context.store.store({
         text: row.normalized,
         vector,
-        importance: 0.62,
+        importance,
         category: row.category,
         scope,
         metadata: JSON.stringify({
@@ -908,11 +938,31 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           groupId: graph.groupId,
           query: query || undefined,
           assertionKind: "inferred",
-          confidence: 0.66,
+          confidence,
           importedAt: Date.now(),
+          graphId: row.graphId,
         }),
       });
       imported++;
+
+      if (syncGraphiti && context.graphitiBridge) {
+        try {
+          await context.graphitiBridge.addEpisode({
+            text: row.normalized,
+            scope,
+            metadata: {
+              imported_from: "lanceDB",
+              importId: `import_${Date.now()}_${imported}`,
+              originalGraphId: row.graphId,
+              sourceKind: row.sourceKind,
+            },
+          });
+          syncedToGraphiti++;
+        } catch (err) {
+          // Log but don't fail the import
+          console.error("Graphiti sync failed for row:", row.normalized.slice(0, 50), String(err));
+        }
+      }
     }
 
     return {
@@ -925,8 +975,13 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       imported,
       skippedDuplicate,
       skippedEmpty,
+      skippedLowScore,
       factsFetched: graph.facts.length,
       nodesFetched: graph.nodes.length,
+      minScore: minScoreClamped,
+      categoryMap: Object.keys(categoryMap).length > 0 ? categoryMap : undefined,
+      syncGraphiti,
+      syncedToGraphiti,
     };
   };
 
@@ -1022,6 +1077,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--scope <scope>", "Target scope", "global")
     .option("--query <query>", "Recall query (used when mode=recall)")
     .option("--limit <n>", "Max nodes/facts fetched", "40")
+    .option("--category-map <map>", "Category map (e.g., entity=person,fact=observation)")
+    .option("--min-score <n>", "Minimum score threshold (0-1)", "0")
+    .option("--sync-graphiti", "Write back Graphiti metadata after import")
     .option("--dry-run", "Analyze without writing to LanceDB")
     .option("--json", "Output as JSON")
     .action(async (options) => {
@@ -1040,9 +1098,13 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         console.log(`• Facts fetched: ${report.factsFetched}`);
         console.log(`• Nodes fetched: ${report.nodesFetched}`);
         console.log(`• Candidates scanned: ${report.scanned}`);
+        console.log(`• Filtered by min-score: ${report.skippedLowScore}`);
         console.log(`• Imported: ${report.imported}`);
         console.log(`• Skipped duplicates: ${report.skippedDuplicate}`);
         console.log(`• Skipped empty: ${report.skippedEmpty}`);
+        if (report.syncGraphiti) {
+          console.log(`• Synced to Graphiti: ${report.syncedToGraphiti}`);
+        }
       } catch (error) {
         console.error("Graph import failed:", error);
         process.exit(1);
@@ -1237,6 +1299,109 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         console.log(`Workspace docs refreshed at ${workspaceDir}`);
       } catch (error) {
         console.error("Docs refresh failed:", error);
+        process.exit(1);
+      }
+    });
+
+  memory
+    .command("dedupe")
+    .description("Remove duplicate memories based on text similarity")
+    .option("--scope <scope>", "Scope to scan", "global")
+    .option("--threshold <n>", "Similarity threshold (0-1)", "0.95")
+    .option("--dry-run", "Show duplicates without deleting")
+    .option("--json", "Output as JSON")
+    .action(async (options) => {
+      try {
+        const scope = typeof options.scope === "string" && options.scope.trim().length > 0
+          ? options.scope.trim()
+          : "global";
+        const threshold = Math.max(0, Math.min(1, parseFloat(String(options.threshold ?? "0.95")) || 0.95));
+        const dryRun = options.dryRun === true;
+
+        const entries = await context.store.list([scope], undefined, 10000, 0);
+        if (entries.length === 0) {
+          console.log("No memories found to deduplicate.");
+          return;
+        }
+
+        const textToIds: Record<string, string[]> = {};
+        for (const entry of entries) {
+          const normalized = entry.text.toLowerCase().replace(/\s+/g, " ").trim();
+          if (!textToIds[normalized]) {
+            textToIds[normalized] = [];
+          }
+          textToIds[normalized].push(entry.id);
+        }
+
+        const duplicates: Array<{ text: string; ids: string[]; keep: string }> = [];
+        for (const [text, ids] of Object.entries(textToIds)) {
+          if (ids.length > 1) {
+            const sortedByTime = entries
+              .filter((e) => ids.includes(e.id))
+              .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            duplicates.push({
+              text: text.slice(0, 100) + (text.length > 100 ? "..." : ""),
+              ids,
+              keep: sortedByTime[0]?.id || "",
+            });
+          }
+        }
+
+        if (duplicates.length === 0) {
+          console.log("No duplicates found.");
+          return;
+        }
+
+        const toDelete: string[] = [];
+        for (const dup of duplicates) {
+          for (const id of dup.ids) {
+            if (id !== dup.keep) {
+              toDelete.push(id);
+            }
+          }
+        }
+
+        const report = {
+          scope,
+          threshold,
+          totalMemories: entries.length,
+          duplicateGroups: duplicates.length,
+          duplicateCount: toDelete.length,
+          dryRun,
+          duplicates: duplicates.slice(0, 20).map((d) => ({
+            text: d.text,
+            count: d.ids.length,
+            keep: d.keep,
+          })),
+        };
+
+        if (options.json) {
+          console.log(formatJson(report));
+          return;
+        }
+
+        console.log("Deduplication Report:");
+        console.log(`• Scope: ${report.scope}`);
+        console.log(`• Threshold: ${report.threshold}`);
+        console.log(`• Total memories: ${report.totalMemories}`);
+        console.log(`• Duplicate groups: ${report.duplicateGroups}`);
+        console.log(`• Duplicates to remove: ${report.duplicateCount}`);
+        console.log(`• Dry run: ${dryRun ? "Yes" : "No"}`);
+
+        if (!dryRun && toDelete.length > 0) {
+          let deleted = 0;
+          for (const id of toDelete) {
+            try {
+              await context.store.delete(id, [scope]);
+              deleted++;
+            } catch (err) {
+              console.error(`Failed to delete ${id}:`, String(err));
+            }
+          }
+          console.log(`• Actually deleted: ${deleted}`);
+        }
+      } catch (error) {
+        console.error("Deduplication failed:", error);
         process.exit(1);
       }
     });
