@@ -2309,7 +2309,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         baseUrl:
           typeof graphitiRaw.baseUrl === "string" && graphitiRaw.baseUrl.trim().length > 0
             ? resolveEnvVars(graphitiRaw.baseUrl)
-            : "http://localhost:8001",
+            : "http://localhost:8000",
         transport:
           graphitiRaw.transport === "mcp" || graphitiRaw.transport === "auto"
             ? graphitiRaw.transport
@@ -2388,11 +2388,6 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallExcludeReflection: parseBoolean(cfg.autoRecallExcludeReflection, true),
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
-    autoRecallTopK: parsePositiveInt(cfg.autoRecallTopK) ?? DEFAULT_AUTO_RECALL_TOP_K,
-    autoRecallCategories: parseMemoryCategories(cfg.autoRecallCategories, DEFAULT_AUTO_RECALL_CATEGORIES),
-    autoRecallExcludeReflection: typeof cfg.autoRecallExcludeReflection === "boolean"
-      ? cfg.autoRecallExcludeReflection
-      : DEFAULT_AUTO_RECALL_EXCLUDE_REFLECTION,
     autoRecallMaxAgeDays: parsePositiveInt(cfg.autoRecallMaxAgeDays) ?? DEFAULT_AUTO_RECALL_MAX_AGE_DAYS,
     autoRecallMaxEntriesPerKey: parsePositiveInt(cfg.autoRecallMaxEntriesPerKey) ?? DEFAULT_AUTO_RECALL_MAX_ENTRIES_PER_KEY,
     captureAssistant: cfg.captureAssistant === true,
