@@ -183,6 +183,7 @@ Query → BM25 FTS ─────┘
   - 需要 `sessionStrategy="memoryReflection"`。
   - 触发于 `command:new` / `command:reset`。
   - 若会话上下文不完整（例如缺少配置、session 文件、或可读对话内容），则跳过生成。
+  - 边界场景：在刚 `/new` 后立即再次 `/new`，可能进入一个没有可读上一轮 `sessionFile` 的新空会话；此时 reflection 会跳过并记录 `missing session file after recovery`。这属于预期行为。
 - 执行链：
   - 先尝试 embedded runner（`runEmbeddedPiAgent`）。
   - 若 embedded 路径失败，则回退到 `openclaw agent --local --json`。

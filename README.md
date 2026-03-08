@@ -187,6 +187,7 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - Requires `sessionStrategy="memoryReflection"`.
   - Triggers on `command:new` / `command:reset`.
   - Skips generation when session context is incomplete (for example missing config, session file, or readable conversation content).
+  - Edge case: issuing `/new` immediately after a previous `/new` can land in a fresh empty session without a readable prior `sessionFile`; in that case reflection skips and logs `missing session file after recovery`. This is expected behavior.
 - Runner chain:
   - First try embedded runner (`runEmbeddedPiAgent`).
   - If the embedded path fails, fall back to `openclaw agent --local --json`.
