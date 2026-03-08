@@ -43,6 +43,7 @@ import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.
 import { createMemoryCLI } from "./cli.js";
 import { createGraphitiBridge } from "./src/graphiti/bridge.js";
 import { createGraphitiSyncService } from "./src/graphiti/sync.js";
+import { buildGraphReflectionContext } from "./src/graphiti/reflection.js";
 import { createWorkspaceDocsMaterializer } from "./src/workspace-docs.js";
 import type { GraphitiPluginConfig } from "./src/graphiti/types.js";
 import { extractReflectionOpenLoops } from "./src/reflection-slices.js";
@@ -1786,12 +1787,24 @@ const memoryLanceDBProPlugin = {
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
+          const graphReflectionContext = await buildGraphReflectionContext({
+            bridge: graphitiBridge,
+            enabled: config.graphiti?.enabled === true,
+            scope: targetScope,
+            conversation,
+            limitNodes: config.graphiti?.read?.topKNodes ?? 6,
+            limitFacts: config.graphiti?.read?.topKFacts ?? 10,
+            logger: api.logger,
+          });
+          const conversationForReflection = graphReflectionContext?.contextBlock
+            ? `${conversation}\n\n${graphReflectionContext.contextBlock}`
+            : conversation;
 
           api.logger.info(
             `memory-reflection: command:${action} reflection generation start for session ${currentSessionId}; timeoutMs=${reflectionTimeoutMs}`
           );
           const reflectionGenerated = await generateReflectionText({
-            conversation,
+            conversation: conversationForReflection,
             maxInputChars: reflectionMaxInputChars,
             cfg,
             agentId: reflectionRunAgentId,
@@ -1859,9 +1872,13 @@ const memoryLanceDBProPlugin = {
             `- Session ID: ${currentSessionId || "unknown"}`,
             `- Command: ${String(event.action || "unknown")}`,
             `- Error Signatures: ${toolErrorSignals.length ? toolErrorSignals.map((s) => s.signatureHash).join(", ") : "(none)"}`,
+            `- Graph Query: ${graphReflectionContext?.query || "(none)"}`,
             "",
           ].join("\n");
-          const reflectionBody = `${header}${reflectionText.trim()}\n`;
+          const graphSnapshotSuffix = graphReflectionContext?.snapshotBlock
+            ? `\n\n${graphReflectionContext.snapshotBlock}\n`
+            : "\n";
+          const reflectionBody = `${header}${reflectionText.trim()}${graphSnapshotSuffix}`;
 
           const outDir = join(workspaceDir, "memory", "reflections", dateStr);
           await mkdir(outDir, { recursive: true });
@@ -1913,6 +1930,82 @@ const memoryLanceDBProPlugin = {
             agentId: sourceAgentId,
             command: String(event.action || "unknown"),
           });
+
+          const graphInferenceCandidates = graphReflectionContext?.inferredCandidates ?? [];
+          for (const candidate of graphInferenceCandidates) {
+            const inferredText = `[graph-inferred] ${candidate.text}`;
+            const inferredVector = await embedder.embedPassage(inferredText);
+            let inferredExisting: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            try {
+              inferredExisting = await store.vectorSearch(inferredVector, 1, 0.1, [targetScope]);
+            } catch (err) {
+              api.logger.warn(
+                `memory-reflection: graph inference duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+
+            if (inferredExisting.length > 0 && inferredExisting[0].score > 0.97) {
+              continue;
+            }
+
+            const inferredMetadata = JSON.stringify({
+              source: "graphiti_inference",
+              assertionKind: "inferred",
+              confidence: candidate.confidence,
+              evidenceFact: candidate.evidenceFact,
+              reflectionEventId,
+              sessionKey,
+              sessionId: currentSessionId || "unknown",
+              agentId: sourceAgentId,
+              scope: targetScope,
+              sourceReflectionPath: relPath,
+              runAt: nowTs,
+            });
+
+            const inferredEntry = await store.store({
+              text: inferredText,
+              vector: inferredVector,
+              importance: Math.max(0.45, Math.min(0.75, candidate.confidence)),
+              category: "fact",
+              scope: targetScope,
+              metadata: inferredMetadata,
+            });
+
+            if (graphitiSync.isEnabled("memoryStore")) {
+              await graphitiSync.syncMemory(
+                {
+                  id: inferredEntry.id,
+                  text: inferredText,
+                  scope: targetScope,
+                  category: inferredEntry.category,
+                  metadata: inferredEntry.metadata,
+                },
+                {
+                  mode: "memoryStore",
+                  source: "graphiti:inference",
+                  agentId: sourceAgentId,
+                  mutation: "graph_inference",
+                  extraMetadata: {
+                    reflectionEventId,
+                    confidence: candidate.confidence,
+                    evidenceFact: candidate.evidenceFact,
+                  },
+                },
+              );
+            }
+
+            if (mdMirror) {
+              await mdMirror(
+                {
+                  text: inferredText,
+                  category: inferredEntry.category,
+                  scope: targetScope,
+                  timestamp: inferredEntry.timestamp,
+                },
+                { source: "graphiti:inference", agentId: sourceAgentId },
+              );
+            }
+          }
 
           const mappedReflectionMemories = extractReflectionMappedMemoryItems(reflectionText);
           for (const mapped of mappedReflectionMemories) {
