@@ -10,7 +10,7 @@ import { readFile, readdir, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 
 // Import core components
-import { MemoryStore, validateStoragePath } from "./src/store.js";
+import { MemoryStore, validateStoragePath, type MemoryEntry } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager } from "./src/scopes.js";
@@ -21,6 +21,13 @@ import { AccessTracker } from "./src/access-tracker.js";
 import { createMemoryCLI } from "./cli.js";
 import { createGraphitiBridge } from "./src/graphiti/bridge.js";
 import type { GraphitiPluginConfig } from "./src/graphiti/types.js";
+import { extractReflectionOpenLoops } from "./src/reflection-slices.js";
+import {
+  loadAgentDerivedRowsWithScoresFromEntries,
+  loadAgentReflectionSlicesFromEntries,
+} from "./src/reflection-store.js";
+import { rankDynamicReflectionRecallFromEntries } from "./src/reflection-recall.js";
+import { resolveReflectionSessionSearchDirs } from "./src/session-recovery.js";
 
 // ============================================================================
 // Configuration & Types
@@ -36,10 +43,14 @@ interface PluginConfig {
     taskQuery?: string;
     taskPassage?: string;
     normalized?: boolean;
+    chunking?: boolean;
   };
   dbPath?: string;
   autoCapture?: boolean;
   autoRecall?: boolean;
+  autoRecallTopK?: number;
+  autoRecallCategories?: Array<"preference" | "fact" | "decision" | "entity" | "other" | "reflection">;
+  autoRecallExcludeReflection?: boolean;
   autoRecallMinLength?: number;
   captureAssistant?: boolean;
   retrieval?: {
@@ -68,9 +79,44 @@ interface PluginConfig {
     agentAccess?: Record<string, string[]>;
   };
   enableManagementTools?: boolean;
+  sessionStrategy?: SessionStrategy;
+  selfImprovement?: {
+    enabled?: boolean;
+    beforeResetNote?: boolean;
+    skipSubagentBootstrap?: boolean;
+    ensureLearningFiles?: boolean;
+  };
+  memoryReflection: {
+    enabled: boolean;
+    injectMode: ReflectionInjectMode;
+    messageCount: number;
+    storeToLanceDB: boolean;
+    recall: ReflectionRecallConfig;
+  };
   sessionMemory?: { enabled?: boolean; messageCount?: number };
   graphiti?: GraphitiPluginConfig;
 }
+
+type SessionStrategy = "memoryReflection" | "systemSessionMemory" | "none";
+type ReflectionInjectMode = "inheritance-only" | "inheritance+derived";
+type ReflectionRecallKind = "invariant" | "derived";
+
+interface ReflectionRecallConfig {
+  mode: "fixed" | "dynamic";
+  topK: number;
+  includeKinds: ReflectionRecallKind[];
+  maxAgeDays?: number;
+  maxEntriesPerKey?: number;
+  minRepeated?: number;
+  minScore?: number;
+  minPromptLength?: number;
+}
+
+const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
+const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
+const DEFAULT_REFLECTION_RECALL_TOP_K = 6;
+const DEFAULT_AUTO_RECALL_TOP_K = 3;
+const DEFAULT_AUTO_RECALL_CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
 
 // ============================================================================
 // Default Configuration
@@ -110,6 +156,22 @@ function parseBoolean(value: unknown, fallback: boolean): boolean {
     return value;
   }
   return fallback;
+}
+
+function parseNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const resolved = resolveEnvVars(value.trim());
+    const n = Number(resolved);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 // ============================================================================
@@ -296,6 +358,10 @@ async function readSessionContentWithResetFallback(
   return primary;
 }
 
+export async function readSessionConversationWithResetFallback(sessionFilePath: string, messageCount: number): Promise<string | null> {
+  return await readSessionContentWithResetFallback(sessionFilePath, messageCount);
+}
+
 function stripResetSuffix(fileName: string): string {
   const resetIndex = fileName.indexOf(".reset.");
   return resetIndex === -1 ? fileName : fileName.slice(0, resetIndex);
@@ -345,6 +411,101 @@ async function findPreviousSessionFile(
       if (nonReset.length > 0) return join(sessionsDir, nonReset[0]);
     }
   } catch {}
+}
+
+function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
+  const key = asNonEmptyString(sessionKey);
+  if (!key) return undefined;
+  const matched = key.match(/^agent:([^:]+):/);
+  return matched?.[1]?.trim() || undefined;
+}
+
+type ReflectionErrorSignal = {
+  at: number;
+  toolName: string;
+  summary: string;
+};
+
+type ReflectionDerivedCache = {
+  updatedAt: number;
+  derived: string[];
+};
+
+const reflectionErrorSignalsBySession = new Map<string, ReflectionErrorSignal[]>();
+const reflectionDerivedBySession = new Map<string, ReflectionDerivedCache>();
+
+function extractTextFromToolResult(result: unknown): string {
+  if (typeof result === "string") return result;
+  if (!result || typeof result !== "object") return "";
+  const obj = result as Record<string, unknown>;
+  const content = obj.content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((part) => part && typeof part === "object")
+      .map((part) => asNonEmptyString((part as Record<string, unknown>).text) || "")
+      .filter(Boolean)
+      .join("\n");
+  }
+  return asNonEmptyString(obj.text) || "";
+}
+
+function looksLikeErrorText(text: string): boolean {
+  return /\b(error|failed|exception|timeout|timed out|econn|enoent|eperm)\b/i.test(text);
+}
+
+async function loadEmbeddedReflectionText(): Promise<string | undefined> {
+  const envPath = asNonEmptyString(process.env.OPENCLAW_EXTENSION_API_PATH);
+  if (!envPath) return undefined;
+
+  try {
+    const mod = await import(envPath.startsWith("file://") ? envPath : new URL(envPath, import.meta.url).href);
+    const runner = (mod as Record<string, unknown>).runEmbeddedPiAgent;
+    if (typeof runner !== "function") return undefined;
+    const result = await (runner as () => Promise<unknown>)();
+    if (!result || typeof result !== "object") return undefined;
+    const payloads = (result as Record<string, unknown>).payloads;
+    if (!Array.isArray(payloads)) return undefined;
+    for (const payload of payloads) {
+      if (!payload || typeof payload !== "object") continue;
+      const text = asNonEmptyString((payload as Record<string, unknown>).text);
+      if (text) return text;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildSelfImprovementNote(params: { openLoops: string[]; derivedFocus: string[] }): string {
+  const openLoops = params.openLoops.length > 0 ? params.openLoops : ["(none captured)"];
+  const blocks = [
+    SELF_IMPROVEMENT_NOTE_PREFIX,
+    "<open-loops>",
+    ...openLoops.map((line) => `- ${line}`),
+    "</open-loops>",
+  ];
+
+  if (params.derivedFocus.length > 0) {
+    blocks.push(
+      "<derived-focus>",
+      ...params.derivedFocus.map((line) => `- ${line}`),
+      "</derived-focus>"
+    );
+  }
+
+  return blocks.join("\n");
+}
+
+function getReflectionErrorReminders(sessionKey: string, maxEntries = 3): ReflectionErrorSignal[] {
+  const current = reflectionErrorSignalsBySession.get(sessionKey) ?? [];
+  return current.slice(-Math.max(1, Math.floor(maxEntries)));
+}
+
+function pushReflectionErrorSignal(sessionKey: string, signal: ReflectionErrorSignal): void {
+  const current = reflectionErrorSignalsBySession.get(sessionKey) ?? [];
+  current.push(signal);
+  if (current.length > 16) current.splice(0, current.length - 16);
+  reflectionErrorSignalsBySession.set(sessionKey, current);
 }
 
 // ============================================================================
@@ -407,6 +568,7 @@ const memoryLanceDBProPlugin = {
       taskQuery: config.embedding.taskQuery,
       taskPassage: config.embedding.taskPassage,
       normalized: config.embedding.normalized,
+      chunking: config.embedding.chunking,
     });
     const retriever = createRetriever(store, embedder, {
       ...DEFAULT_RETRIEVAL_CONFIG,
@@ -510,15 +672,24 @@ const memoryLanceDBProPlugin = {
           // Determine agent ID and accessible scopes
           const agentId = ctx?.agentId || "main";
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
+          const topK = Number.isFinite(config.autoRecallTopK)
+            ? Math.max(1, Math.floor(Number(config.autoRecallTopK)))
+            : DEFAULT_AUTO_RECALL_TOP_K;
 
           const results = await retriever.retrieve({
             query: event.prompt,
-            limit: 3,
+            limit: topK * 2,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
           });
 
-          if (results.length === 0) {
+          const allowedCategories = new Set(config.autoRecallCategories || DEFAULT_AUTO_RECALL_CATEGORIES);
+          const filtered = results
+            .filter((r) => allowedCategories.has(r.entry.category as any))
+            .filter((r) => !(config.autoRecallExcludeReflection && r.entry.category === "reflection"))
+            .slice(0, topK);
+
+          if (filtered.length === 0) {
             return;
           }
 
@@ -718,10 +889,206 @@ const memoryLanceDBProPlugin = {
     }
 
     // ========================================================================
+    // Memory Reflection Hooks (sessionStrategy=memoryReflection)
+    // ========================================================================
+
+    if (config.sessionStrategy === "memoryReflection") {
+      const reflectionRecall = config.memoryReflection.recall;
+
+      const loadReflectionEntries = async (agentId: string): Promise<MemoryEntry[]> => {
+        const scopes = scopeManager.getAccessibleScopes(agentId);
+        return await store.list(scopes, "reflection", 400, 0);
+      };
+
+      api.on("after_tool_call", (event, ctx) => {
+        const sessionKey = asNonEmptyString(ctx?.sessionKey);
+        if (!sessionKey) return;
+
+        if (typeof event?.error === "string" && event.error.trim().length > 0) {
+          pushReflectionErrorSignal(sessionKey, {
+            at: Date.now(),
+            toolName: asNonEmptyString(event.toolName) || "unknown",
+            summary: event.error.trim(),
+          });
+          return;
+        }
+
+        const resultText = extractTextFromToolResult(event?.result);
+        if (resultText && looksLikeErrorText(resultText)) {
+          pushReflectionErrorSignal(sessionKey, {
+            at: Date.now(),
+            toolName: asNonEmptyString(event?.toolName) || "unknown",
+            summary: resultText.replace(/\s+/g, " ").trim().slice(0, 220),
+          });
+        }
+      }, { priority: 15 });
+
+      api.on("before_agent_start", async (_event, ctx) => {
+        try {
+          const agentId = asNonEmptyString(ctx?.agentId) || "main";
+          const entries = await loadReflectionEntries(agentId);
+
+          let lines: string[] = [];
+          if (reflectionRecall.mode === "dynamic") {
+            const rows = rankDynamicReflectionRecallFromEntries(entries, {
+              agentId,
+              includeKinds: reflectionRecall.includeKinds,
+              topK: reflectionRecall.topK,
+              maxAgeMs: Number.isFinite(reflectionRecall.maxAgeDays)
+                ? Math.max(1, Number(reflectionRecall.maxAgeDays)) * 24 * 60 * 60 * 1000
+                : undefined,
+              maxEntriesPerKey: reflectionRecall.maxEntriesPerKey,
+              minScore: reflectionRecall.minScore,
+            });
+            lines = rows.map((row) => row.text);
+          } else {
+            const slices = loadAgentReflectionSlicesFromEntries({
+              entries,
+              agentId,
+            });
+            lines = slices.invariants;
+          }
+
+          const topK = Number.isFinite(reflectionRecall.topK)
+            ? Math.max(1, Math.floor(Number(reflectionRecall.topK)))
+            : DEFAULT_REFLECTION_RECALL_TOP_K;
+          const selected = lines.slice(0, topK);
+          if (selected.length === 0) return;
+
+          return {
+            prependContext: [
+              "<inherited-rules>",
+              "Stable rules inherited from memory-lancedb-pro reflections. Treat as long-term behavioral constraints unless user overrides.",
+              ...selected.map((line, i) => `${i + 1}. ${line}`),
+              "</inherited-rules>",
+            ].join("\n"),
+          };
+        } catch (err) {
+          api.logger.warn(`memory-reflection: inheritance injection failed: ${String(err)}`);
+        }
+      }, { priority: 12 });
+
+      api.on("before_prompt_build", async (_event, ctx) => {
+        const sessionKey = asNonEmptyString(ctx?.sessionKey);
+        const blocks: string[] = [];
+        const pending = sessionKey ? getReflectionErrorReminders(sessionKey, 3) : [];
+
+        if (pending.length === 0 && config.memoryReflection.injectMode === "inheritance+derived" && sessionKey) {
+          const derived = reflectionDerivedBySession.get(sessionKey)?.derived ?? [];
+          if (derived.length > 0) {
+            blocks.push([
+              "<derived-focus>",
+              "Latest derived execution deltas from reflection memory:",
+              ...derived.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
+              "</derived-focus>",
+            ].join("\n"));
+          }
+        }
+
+        if (pending.length > 0) {
+          blocks.push([
+            "<error-detected>",
+            "A tool error was detected. Consider logging this to `.learnings/ERRORS.md` if it is non-trivial or likely to recur.",
+            "Recent error signals:",
+            ...pending.map((signal, i) => `${i + 1}. [${signal.toolName}] ${signal.summary}`),
+            "</error-detected>",
+          ].join("\n"));
+        }
+
+        if (blocks.length === 0) return;
+        return { prependContext: blocks.join("\n\n") };
+      }, { priority: 15 });
+
+      api.on("session_end", (_event, ctx) => {
+        const sessionKey = asNonEmptyString(ctx?.sessionKey);
+        if (!sessionKey) return;
+        reflectionErrorSignalsBySession.delete(sessionKey);
+        reflectionDerivedBySession.delete(sessionKey);
+      }, { priority: 20 });
+
+      api.registerHook("command:new", async (event) => {
+        try {
+          if (!Array.isArray(event.messages)) return;
+          if (event.messages.some((item: unknown) => typeof item === "string" && item.includes(SELF_IMPROVEMENT_NOTE_PREFIX))) {
+            return;
+          }
+
+          const context = (event.context || {}) as Record<string, unknown>;
+          const cfg = (context.cfg || {}) as Record<string, unknown>;
+          const sourceAgentId = parseAgentIdFromSessionKey(asNonEmptyString(event.sessionKey)) || "main";
+          const workspaceDir = asNonEmptyString(context.workspaceDir) || join(homedir(), ".openclaw", "workspace");
+
+          const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
+          const currentSessionId = asNonEmptyString(sessionEntry.sessionId) || "unknown";
+          let currentSessionFile = asNonEmptyString(sessionEntry.sessionFile);
+
+          if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
+            const searchDirs = resolveReflectionSessionSearchDirs({
+              context,
+              cfg,
+              workspaceDir,
+              currentSessionFile,
+              sourceAgentId,
+            });
+
+            for (const sessionsDir of searchDirs) {
+              const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
+              if (recovered) {
+                currentSessionFile = recovered;
+                break;
+              }
+            }
+          }
+
+          if (!currentSessionFile) return;
+
+          const conversation = await readSessionConversationWithResetFallback(
+            currentSessionFile,
+            config.memoryReflection.messageCount
+          );
+          if (!conversation) return;
+
+          const reflectionText = (await loadEmbeddedReflectionText()) || "";
+          const openLoops = reflectionText ? extractReflectionOpenLoops(reflectionText) : [];
+          const entries = await loadReflectionEntries(sourceAgentId);
+          const derivedFocus = loadAgentDerivedRowsWithScoresFromEntries({
+            entries,
+            agentId: sourceAgentId,
+          })
+            .map((row) => row.text)
+            .slice(0, 6);
+
+          const sessionKey = asNonEmptyString(event.sessionKey);
+          if (sessionKey) {
+            reflectionDerivedBySession.set(sessionKey, {
+              updatedAt: Date.now(),
+              derived: derivedFocus,
+            });
+          }
+
+          if (config.selfImprovement?.enabled === false || config.selfImprovement?.beforeResetNote === false) return;
+          event.messages.push(
+            buildSelfImprovementNote({
+              openLoops,
+              derivedFocus,
+            })
+          );
+        } catch (err) {
+          api.logger.warn(`memory-reflection: command:new hook failed: ${String(err)}`);
+        }
+      }, {
+        name: "memory-lancedb-pro.memory-reflection.command-new",
+        description: "Generate reflection handoff note before /new",
+      });
+
+      api.logger.info("memory-reflection: integrated hooks registered (command:new, after_tool_call, before_agent_start, before_prompt_build)");
+    }
+
+    // ========================================================================
     // Session Memory Hook (replaces built-in session-memory)
     // ========================================================================
 
-    if (config.sessionMemory?.enabled === true) {
+    if (config.sessionStrategy === "systemSessionMemory" && config.sessionMemory?.enabled === true) {
       // DISABLED by default (2026-07-09): session summaries stored in LanceDB pollute
       // retrieval quality. OpenClaw already saves .jsonl files to ~/.openclaw/agents/*/sessions/
       // and memorySearch.sources: ["memory", "sessions"] can search them directly.
@@ -972,7 +1339,28 @@ const memoryLanceDBProPlugin = {
   },
 };
 
-function parsePluginConfig(value: unknown): PluginConfig {
+function parseAutoRecallCategories(value: unknown): Array<"preference" | "fact" | "decision" | "entity" | "other" | "reflection"> {
+  if (!Array.isArray(value)) return [...DEFAULT_AUTO_RECALL_CATEGORIES];
+  const allowed = new Set(["preference", "fact", "decision", "entity", "other", "reflection"]);
+  const normalized = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item): item is "preference" | "fact" | "decision" | "entity" | "other" | "reflection" => allowed.has(item));
+  if (normalized.length === 0) return [...DEFAULT_AUTO_RECALL_CATEGORIES];
+  return [...new Set(normalized)];
+}
+
+function parseReflectionIncludeKinds(value: unknown): ReflectionRecallKind[] {
+  if (!Array.isArray(value)) return ["invariant"];
+  const normalized = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item): item is ReflectionRecallKind => item === "invariant" || item === "derived");
+  if (normalized.length === 0) return ["invariant"];
+  return [...new Set(normalized)];
+}
+
+export function parsePluginConfig(value: unknown): PluginConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("memory-lancedb-pro config required");
   }
@@ -1008,6 +1396,56 @@ function parsePluginConfig(value: unknown): PluginConfig {
   if (!apiKey || (Array.isArray(apiKey) && apiKey.length === 0)) {
     throw new Error("embedding.apiKey is required (set directly or via OPENAI_API_KEY env var)");
   }
+
+  const sessionMemoryRaw =
+    typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
+      ? (cfg.sessionMemory as Record<string, unknown>)
+      : undefined;
+  const memoryReflectionRaw =
+    typeof cfg.memoryReflection === "object" && cfg.memoryReflection !== null
+      ? (cfg.memoryReflection as Record<string, unknown>)
+      : undefined;
+
+  const explicitSessionStrategy = cfg.sessionStrategy;
+  const legacySessionMemoryEnabled = typeof sessionMemoryRaw?.enabled === "boolean"
+    ? sessionMemoryRaw.enabled
+    : undefined;
+  const sessionStrategy: SessionStrategy =
+    explicitSessionStrategy === "systemSessionMemory" ||
+      explicitSessionStrategy === "memoryReflection" ||
+      explicitSessionStrategy === "none"
+      ? explicitSessionStrategy
+      : legacySessionMemoryEnabled === true
+        ? "systemSessionMemory"
+        : legacySessionMemoryEnabled === false
+          ? "none"
+          : "systemSessionMemory";
+
+  const reflectionRecallRaw =
+    typeof memoryReflectionRaw?.recall === "object" && memoryReflectionRaw.recall !== null
+      ? (memoryReflectionRaw.recall as Record<string, unknown>)
+      : {};
+  const reflectionRecallMode =
+    reflectionRecallRaw.mode === "dynamic" || reflectionRecallRaw.mode === "fixed"
+      ? reflectionRecallRaw.mode
+      : "fixed";
+  const reflectionRecallTopK = parsePositiveInt(reflectionRecallRaw.topK) ?? DEFAULT_REFLECTION_RECALL_TOP_K;
+  const reflectionRecall: ReflectionRecallConfig = {
+    mode: reflectionRecallMode,
+    topK: reflectionRecallTopK,
+    includeKinds: parseReflectionIncludeKinds(reflectionRecallRaw.includeKinds),
+    maxAgeDays: parsePositiveInt(reflectionRecallRaw.maxAgeDays),
+    maxEntriesPerKey: parsePositiveInt(reflectionRecallRaw.maxEntriesPerKey),
+    minRepeated: parsePositiveInt(reflectionRecallRaw.minRepeated),
+    minScore: parseNumber(reflectionRecallRaw.minScore),
+    minPromptLength: parsePositiveInt(reflectionRecallRaw.minPromptLength),
+  };
+
+  const injectModeRaw = memoryReflectionRaw?.injectMode;
+  const injectMode: ReflectionInjectMode =
+    injectModeRaw === "inheritance-only" || injectModeRaw === "inheritance+derived"
+      ? injectModeRaw
+      : "inheritance+derived";
 
   const graphitiRaw =
     typeof cfg.graphiti === "object" && cfg.graphiti !== null
@@ -1090,6 +1528,9 @@ function parsePluginConfig(value: unknown): PluginConfig {
     autoCapture: cfg.autoCapture !== false,
     // Default OFF: only enable when explicitly set to true.
     autoRecall: cfg.autoRecall === true,
+    autoRecallTopK: parsePositiveInt(cfg.autoRecallTopK) ?? DEFAULT_AUTO_RECALL_TOP_K,
+    autoRecallCategories: parseAutoRecallCategories(cfg.autoRecallCategories),
+    autoRecallExcludeReflection: parseBoolean(cfg.autoRecallExcludeReflection, true),
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     captureAssistant: cfg.captureAssistant === true,
     retrieval:
@@ -1101,6 +1542,27 @@ function parsePluginConfig(value: unknown): PluginConfig {
         ? (cfg.scopes as any)
         : undefined,
     enableManagementTools: cfg.enableManagementTools === true,
+    sessionStrategy,
+    selfImprovement: typeof cfg.selfImprovement === "object" && cfg.selfImprovement !== null
+      ? {
+        enabled: (cfg.selfImprovement as Record<string, unknown>).enabled !== false,
+        beforeResetNote: (cfg.selfImprovement as Record<string, unknown>).beforeResetNote !== false,
+        skipSubagentBootstrap: (cfg.selfImprovement as Record<string, unknown>).skipSubagentBootstrap !== false,
+        ensureLearningFiles: (cfg.selfImprovement as Record<string, unknown>).ensureLearningFiles !== false,
+      }
+      : {
+        enabled: true,
+        beforeResetNote: true,
+        skipSubagentBootstrap: true,
+        ensureLearningFiles: true,
+      },
+    memoryReflection: {
+      enabled: sessionStrategy === "memoryReflection",
+      injectMode,
+      messageCount: parsePositiveInt(memoryReflectionRaw?.messageCount ?? sessionMemoryRaw?.messageCount) ?? DEFAULT_REFLECTION_MESSAGE_COUNT,
+      storeToLanceDB: parseBoolean(memoryReflectionRaw?.storeToLanceDB, true),
+      recall: reflectionRecall,
+    },
     graphiti,
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
