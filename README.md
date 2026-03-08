@@ -314,7 +314,13 @@ When embedding calls fail, the plugin provides **actionable error messages** ins
 - Keep LanceDB as the primary memory store.
 - Optionally mirror successful `memory_store` writes to Graphiti (`add_episode`) using `scope -> group_id`.
 - Expose graph-native recall via `memory_graph_recall` (separate from `memory_recall`).
+- Reflection can consume Graphiti context snapshots and write low-confidence graph-inferred candidates back to memory.
 - Fail-open behavior: Graphiti outages do not fail `memory_store`.
+
+Operational CLI commands:
+
+- `memory-pro graph-doctor [--json] [--scope <scope>] [--limit <n>]`
+- `memory-pro docs-refresh [--workspace <path>] [--reason <label>]`
 
 Minimal config:
 
