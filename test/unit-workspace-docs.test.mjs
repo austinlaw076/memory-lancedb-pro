@@ -58,3 +58,30 @@ test("workspace docs materializer preserves user-authored content outside marker
   assert.match(userDoc, /memory-lancedb-pro:begin USER/);
   assert.doesNotMatch(userDoc, /old block/);
 });
+
+test("workspace docs conservative gating keeps low-confidence inferred entries out of USER", async () => {
+  const workspaceDir = await mkdtemp(join(tmpdir(), "workspace-docs-"));
+  const materializer = createWorkspaceDocsMaterializer({
+    workspaceDir,
+    store: {
+      list: async () => [
+        {
+          id: "i-1",
+          text: "[graph-inferred] Alice prefers tea over coffee",
+          category: "preference",
+          scope: "global",
+          importance: 0.5,
+          timestamp: Date.now(),
+          metadata: JSON.stringify({ assertionKind: "inferred", confidence: 0.62 }),
+        },
+      ],
+    },
+  });
+
+  await materializer.refresh({ reason: "conservative-gate" });
+
+  const userDoc = await readFile(join(workspaceDir, "USER.md"), "utf-8");
+  const memoryDoc = await readFile(join(workspaceDir, "MEMORY.md"), "utf-8");
+  assert.doesNotMatch(userDoc, /Alice prefers tea over coffee/);
+  assert.match(memoryDoc, /Alice prefers tea over coffee/);
+});
