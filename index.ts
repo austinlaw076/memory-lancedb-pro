@@ -2321,6 +2321,38 @@ export function parsePluginConfig(value: unknown): PluginConfig {
             : undefined,
         timeoutMs: parsePositiveInt(graphitiRaw.timeoutMs) ?? 4000,
         failOpen: parseBoolean(graphitiRaw.failOpen, true),
+        auth: (() => {
+          const authRaw =
+            typeof graphitiRaw.auth === "object" && graphitiRaw.auth !== null
+              ? (graphitiRaw.auth as Record<string, unknown>)
+              : undefined;
+          if (!authRaw) return undefined;
+
+          const tokenFromConfig =
+            typeof authRaw.token === "string" && authRaw.token.trim().length > 0
+              ? resolveEnvVars(authRaw.token).trim()
+              : undefined;
+          const tokenEnv =
+            typeof authRaw.tokenEnv === "string" && authRaw.tokenEnv.trim().length > 0
+              ? authRaw.tokenEnv.trim()
+              : undefined;
+          const tokenFromEnv = tokenEnv
+            ? process.env[tokenEnv]
+            : undefined;
+          const token = tokenFromConfig ||
+            (typeof tokenFromEnv === "string" && tokenFromEnv.trim().length > 0
+              ? tokenFromEnv.trim()
+              : undefined);
+          const headerName =
+            typeof authRaw.headerName === "string" && authRaw.headerName.trim().length > 0
+              ? authRaw.headerName.trim()
+              : "authorization";
+          return {
+            token,
+            tokenEnv,
+            headerName,
+          };
+        })(),
         write: (() => {
           const writeRaw =
             typeof graphitiRaw.write === "object" && graphitiRaw.write !== null

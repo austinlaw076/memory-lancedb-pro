@@ -334,6 +334,30 @@ Minimal config:
 }
 ```
 
+Optional auth config (if your Graphiti MCP endpoint requires a token):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "enabled": true,
+        "config": {
+          "graphiti": {
+            "enabled": true,
+            "baseUrl": "http://localhost:8000",
+            "auth": {
+              "token": "${GRAPHITI_API_TOKEN}",
+              "headerName": "authorization"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
 Rollback (instant):
 
 - Set `graphiti.enabled` to `false`.

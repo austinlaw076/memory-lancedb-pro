@@ -1,6 +1,12 @@
 export type GraphitiTransportMode = "auto" | "mcp";
 export type GraphitiGroupIdMode = "scope" | "fixed";
 
+export interface GraphitiAuthConfig {
+  token?: string;
+  tokenEnv?: string;
+  headerName: string;
+}
+
 export interface GraphitiWriteConfig {
   memoryStore: boolean;
   autoCapture: boolean;
@@ -22,6 +28,7 @@ export interface GraphitiPluginConfig {
   fixedGroupId?: string;
   timeoutMs: number;
   failOpen: boolean;
+  auth?: GraphitiAuthConfig;
   write: GraphitiWriteConfig;
   read: GraphitiReadConfig;
 }

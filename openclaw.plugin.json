@@ -491,6 +491,25 @@
             "default": true,
             "description": "Do not fail memory_store when Graphiti is unavailable"
           },
+          "auth": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "token": {
+                "type": "string",
+                "description": "Optional Graphiti API token (supports ${ENV_VAR} syntax)"
+              },
+              "tokenEnv": {
+                "type": "string",
+                "description": "Optional env var name containing Graphiti API token"
+              },
+              "headerName": {
+                "type": "string",
+                "default": "authorization",
+                "description": "HTTP header used for Graphiti auth token"
+              }
+            }
+          },
           "write": {
             "type": "object",
             "additionalProperties": false,
@@ -884,6 +903,25 @@
       "label": "Graphiti Base URL",
       "placeholder": "http://localhost:8000",
       "help": "Base URL for Graphiti MCP server",
+      "advanced": true
+    },
+    "graphiti.auth.token": {
+      "label": "Graphiti API Token",
+      "sensitive": true,
+      "placeholder": "${GRAPHITI_API_TOKEN}",
+      "help": "Optional token for Graphiti MCP auth. Supports env interpolation.",
+      "advanced": true
+    },
+    "graphiti.auth.tokenEnv": {
+      "label": "Graphiti Token Env",
+      "placeholder": "GRAPHITI_API_TOKEN",
+      "help": "Optional env var name containing the Graphiti auth token.",
+      "advanced": true
+    },
+    "graphiti.auth.headerName": {
+      "label": "Graphiti Auth Header",
+      "placeholder": "authorization",
+      "help": "Header name used for Graphiti auth token (default authorization).",
       "advanced": true
     },
     "graphiti.groupIdMode": {
