@@ -85,3 +85,39 @@ test("workspace docs conservative gating keeps low-confidence inferred entries o
   assert.doesNotMatch(userDoc, /Alice prefers tea over coffee/);
   assert.match(memoryDoc, /Alice prefers tea over coffee/);
 });
+
+test("workspace docs heartbeat includes promotion queue and contradiction hints", async () => {
+  const workspaceDir = await mkdtemp(join(tmpdir(), "workspace-docs-"));
+  const materializer = createWorkspaceDocsMaterializer({
+    workspaceDir,
+    store: {
+      list: async () => [
+        {
+          id: "c1",
+          text: "Alice likes tea",
+          category: "preference",
+          scope: "global",
+          importance: 0.7,
+          timestamp: Date.now(),
+          metadata: "{}",
+        },
+        {
+          id: "c2",
+          text: "Alice does not like tea",
+          category: "preference",
+          scope: "global",
+          importance: 0.7,
+          timestamp: Date.now() + 1,
+          metadata: "{}",
+        },
+      ],
+    },
+  });
+
+  await materializer.refresh({ reason: "contradiction-check" });
+
+  const heartbeat = await readFile(join(workspaceDir, "HEARTBEAT.md"), "utf-8");
+  assert.match(heartbeat, /Promotion Queue/);
+  assert.match(heartbeat, /Contradictions/);
+  assert.match(heartbeat, /likes tea/);
+});

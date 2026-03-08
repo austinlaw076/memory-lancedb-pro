@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { MemoryEntry, MemoryStore } from "./store.js";
+import { applyPromotionPolicy } from "./promotion-policy.js";
 
 interface LoggerLike {
   info?: (message: string) => void;
@@ -103,50 +104,26 @@ function buildDocs(input: {
   generatedAt: string;
   reason: string;
 }): Record<string, string> {
-  const analyzed = input.entries.map((entry) => ({
-    entry,
-    metadata: safeParseJson(entry.metadata),
-  }));
-  const repeatedCounts = countNormalizedTexts(input.entries);
-
-  const isPromotableHighTrust = (row: { entry: MemoryEntry; metadata: Record<string, unknown> }) => {
-    const assertionKind = typeof row.metadata.assertionKind === "string"
-      ? row.metadata.assertionKind
-      : "asserted";
-    if (assertionKind === "asserted") return true;
-    if (assertionKind !== "inferred") return false;
-
-    const confidence = typeof row.metadata.confidence === "number"
-      ? row.metadata.confidence
-      : 0;
-    const repeat = repeatedCounts.get(normalizedKey(row.entry.text)) || 0;
-    return confidence >= 0.75 && repeat >= 2;
-  };
+  const policy = applyPromotionPolicy(input.entries);
 
   const recent = input.entries.slice(0, 30);
-  const prefs = analyzed
-    .filter((row) => row.entry.category === "preference")
-    .filter(isPromotableHighTrust)
-    .map((row) => row.entry)
+  const prefs = policy.promotedByTarget.USER
+    .filter((entry) => entry.category === "preference")
     .slice(0, 12);
-  const decisions = analyzed
-    .filter((row) => row.entry.category === "decision")
-    .filter(isPromotableHighTrust)
-    .map((row) => row.entry)
+  const decisions = policy.promotedByTarget.AGENTS
+    .filter((entry) => entry.category === "decision")
     .slice(0, 12);
-  const entities = analyzed
-    .filter((row) => row.entry.category === "entity")
-    .filter(isPromotableHighTrust)
-    .map((row) => row.entry)
+  const entities = policy.promotedByTarget.USER
+    .filter((entry) => entry.category === "entity")
     .slice(0, 12);
+  const identityRows = policy.promotedByTarget.IDENTITY.slice(0, 12);
+  const soulRows = policy.promotedByTarget.SOUL.slice(0, 12);
 
   const durableForMemory = input.entries
     .filter((e) => e.category !== "reflection")
     .slice(0, 40);
-  const inferredCandidates = analyzed
-    .filter((row) => row.metadata.assertionKind === "inferred")
-    .map((row) => row.entry)
-    .slice(0, 16);
+  const inferredCandidates = policy.inferredCandidates.slice(0, 16);
+  const queueRows = policy.queue.slice(0, 16);
 
   const lines = (rows: MemoryEntry[], maxText = 160) =>
     rows.map((row) => `- [${new Date(row.timestamp).toISOString()}] [${row.category}:${row.scope}] ${row.text.replace(/\s+/g, " ").slice(0, maxText)}`);
@@ -177,8 +154,9 @@ function buildDocs(input: {
       "Mode: conservative",
       "",
       "## Identity Notes",
-      "- Identity promotions are reserved for asserted, high-confidence entries.",
-      "- No identity-level promotions yet.",
+      ...(identityRows.length > 0
+        ? lines(identityRows, 140)
+        : ["- Identity promotions are reserved for asserted, high-confidence entries.", "- No identity-level promotions yet."]),
     ].join("\n"),
     MEMORY: [
       `Generated: ${input.generatedAt}`,
@@ -196,8 +174,9 @@ function buildDocs(input: {
       "Mode: conservative",
       "",
       "## Long-Term Principles",
-      "- Soul-level principles require repeated high-confidence evidence.",
-      "- No soul-level promotions yet.",
+      ...(soulRows.length > 0
+        ? lines(soulRows, 150)
+        : ["- Soul-level principles require repeated high-confidence evidence.", "- No soul-level promotions yet."]),
     ].join("\n"),
     HEARTBEAT: [
       `Generated: ${input.generatedAt}`,
@@ -208,6 +187,16 @@ function buildDocs(input: {
       "",
       "## Pending Verification",
       ...(inferredCandidates.length > 0 ? lines(inferredCandidates.slice(0, 10), 120) : ["- No pending inferred candidates."]),
+      "",
+      "## Promotion Queue",
+      ...(queueRows.length > 0
+        ? queueRows.map((item) => `- [${item.target}] ${item.entry.text.replace(/\s+/g, " ").slice(0, 120)} (reason=${item.reason}, confidence=${item.confidence.toFixed(2)}, repeat=${item.repeatCount})`)
+        : ["- Promotion queue is empty."]),
+      "",
+      "## Contradictions",
+      ...(policy.contradictions.length > 0
+        ? policy.contradictions.slice(0, 8).map((item) => `- ${item.positive.slice(0, 80)} <-> ${item.negative.slice(0, 80)}`)
+        : ["- No contradictions detected."]),
     ].join("\n"),
     TOOLS: [
       `Generated: ${input.generatedAt}`,
@@ -236,37 +225,6 @@ function upsertManagedBlock(content: string, managedBlock: string, begin: string
 
 function escapeRegExp(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function safeParseJson(value: string | undefined): Record<string, unknown> {
-  if (!value || !value.trim()) return {};
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    return {};
-  }
-  return {};
-}
-
-function countNormalizedTexts(entries: MemoryEntry[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const entry of entries) {
-    const key = normalizedKey(entry.text);
-    if (!key) continue;
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-  return counts;
-}
-
-function normalizedKey(text: string): string {
-  return text
-    .replace(/^\[graph-inferred\]\s*/i, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
 }
 
 async function withFileWriteQueue<T>(filePath: string, action: () => Promise<T>): Promise<T> {
