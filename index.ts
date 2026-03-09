@@ -42,6 +42,10 @@ import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { createGraphitiBridge } from "./src/graphiti/bridge.js";
+import { createGraphitiSyncService } from "./src/graphiti/sync.js";
+import { createGraphInferenceJob } from "./src/graphiti/inference.js";
+import { buildGraphReflectionContext } from "./src/graphiti/reflection.js";
+import { createWorkspaceDocsMaterializer } from "./src/workspace-docs.js";
 import type { GraphitiPluginConfig } from "./src/graphiti/types.js";
 import { extractReflectionOpenLoops } from "./src/reflection-slices.js";
 import {
@@ -120,6 +124,16 @@ interface PluginConfig {
     messageCount: number;
     storeToLanceDB: boolean;
     recall: ReflectionRecallConfig;
+  };
+  mdMirror?: {
+    enabled: boolean;
+    dir?: string;
+  };
+  workspaceDocs?: {
+    enabled: boolean;
+    intervalMs: number;
+    markerPrefix: string;
+    refreshOnReflection: boolean;
   };
   sessionMemory?: { enabled?: boolean; messageCount?: number };
   graphiti?: GraphitiPluginConfig;
@@ -213,6 +227,24 @@ function parseNumber(value: unknown): number | undefined {
     const resolved = resolveEnvVars(value.trim());
     const n = Number(resolved);
     if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function parseStringList(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const normalized = value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+    return normalized.length > 0 ? [...new Set(normalized)] : undefined;
+  }
+  if (typeof value === "string") {
+    const normalized = value
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+    return normalized.length > 0 ? [...new Set(normalized)] : undefined;
   }
   return undefined;
 }
@@ -713,6 +745,12 @@ const memoryLanceDBProPlugin = {
           logger: api.logger,
         })
       : undefined;
+    const graphitiSync = createGraphitiSyncService({
+      bridge: graphitiBridge,
+      config: config.graphiti,
+      store,
+      logger: api.logger,
+    });
 
     const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
     const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
@@ -824,6 +862,33 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     const mdMirror = createMdMirrorWriter(api, config);
+    const workspaceDocs = config.workspaceDocs?.enabled
+      ? createWorkspaceDocsMaterializer({
+          store,
+          workspaceDir: getDefaultWorkspaceDir(),
+          markerPrefix: config.workspaceDocs.markerPrefix,
+          logger: api.logger,
+        })
+      : null;
+
+    const refreshWorkspaceDocs = async (reason: string) => {
+      if (!workspaceDocs) return;
+      try {
+        await workspaceDocs.refresh({ reason });
+      } catch (err) {
+        api.logger.warn(`workspace-docs: refresh failed (${reason}): ${String(err)}`);
+      }
+    };
+
+    const runGraphInferenceJob = createGraphInferenceJob({
+      store,
+      embedder,
+      graphitiBridge,
+      graphitiSync,
+      graphitiConfig: config.graphiti,
+      mdMirror,
+      logger: api.logger,
+    });
 
     if (graphitiBridge) {
       setTimeout(() => {
@@ -844,8 +909,10 @@ const memoryLanceDBProPlugin = {
         embedder,
         agentId: undefined, // Will be determined at runtime from context
         graphitiBridge,
+        graphitiSync,
         graphitiConfig: config.graphiti,
         logger: api.logger,
+        mdMirror,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -864,6 +931,10 @@ const memoryLanceDBProPlugin = {
         scopeManager,
         migrator,
         embedder,
+        graphitiBridge,
+        graphitiSync,
+        graphitiConfig: config.graphiti,
+        graphInferenceRun: runGraphInferenceJob,
       }),
       { commands: ["memory-pro"] },
     );
@@ -1081,41 +1152,22 @@ const memoryLanceDBProPlugin = {
               scope: defaultScope,
             });
 
-            if (
-              graphitiBridge &&
-              config.graphiti?.enabled &&
-              config.graphiti.write.autoCapture
-            ) {
-              const graphiti = await graphitiBridge.addEpisode({
-                text,
-                scope: defaultScope,
-                metadata: {
+            if (graphitiSync.isEnabled("autoCapture")) {
+              await graphitiSync.syncMemory(
+                {
+                  id: entry.id,
+                  text,
+                  scope: defaultScope,
+                  category: entry.category,
+                  metadata: entry.metadata,
+                },
+                {
+                  mode: "autoCapture",
                   source: "agent_end",
                   agentId,
-                  memoryId: entry.id,
-                  category: entry.category,
-                  scope: entry.scope,
+                  mutation: "auto_capture",
                 },
-              });
-
-              if (graphiti.status !== "skipped") {
-                try {
-                  const currentMetadata = safeParseJson(entry.metadata);
-                  const nextMetadata = {
-                    ...currentMetadata,
-                    graphiti: {
-                      groupId: graphiti.groupId,
-                      episodeRef: graphiti.episodeRef,
-                      status: graphiti.status,
-                      error: graphiti.error,
-                      updatedAt: new Date().toISOString(),
-                    },
-                  };
-                  await store.update(entry.id, { metadata: JSON.stringify(nextMetadata) }, [defaultScope]);
-                } catch (err) {
-                  api.logger.warn(`memory-lancedb-pro: auto-capture graphiti metadata update failed: ${String(err)}`);
-                }
-              }
+              );
             }
             stored++;
 
@@ -1132,6 +1184,7 @@ const memoryLanceDBProPlugin = {
             api.logger.info(
               `memory-lancedb-pro: auto-captured ${stored} memories for agent ${agentId} in scope ${defaultScope}`,
             );
+            void refreshWorkspaceDocs("auto_capture");
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
@@ -1767,12 +1820,24 @@ const memoryLanceDBProPlugin = {
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
+          const graphReflectionContext = await buildGraphReflectionContext({
+            bridge: graphitiBridge,
+            enabled: config.graphiti?.enabled === true,
+            scope: targetScope,
+            conversation,
+            limitNodes: config.graphiti?.read?.topKNodes ?? 6,
+            limitFacts: config.graphiti?.read?.topKFacts ?? 10,
+            logger: api.logger,
+          });
+          const conversationForReflection = graphReflectionContext?.contextBlock
+            ? `${conversation}\n\n${graphReflectionContext.contextBlock}`
+            : conversation;
 
           api.logger.info(
             `memory-reflection: command:${action} reflection generation start for session ${currentSessionId}; timeoutMs=${reflectionTimeoutMs}`
           );
           const reflectionGenerated = await generateReflectionText({
-            conversation,
+            conversation: conversationForReflection,
             maxInputChars: reflectionMaxInputChars,
             cfg,
             agentId: reflectionRunAgentId,
@@ -1840,9 +1905,13 @@ const memoryLanceDBProPlugin = {
             `- Session ID: ${currentSessionId || "unknown"}`,
             `- Command: ${String(event.action || "unknown")}`,
             `- Error Signatures: ${toolErrorSignals.length ? toolErrorSignals.map((s) => s.signatureHash).join(", ") : "(none)"}`,
+            `- Graph Query: ${graphReflectionContext?.query || "(none)"}`,
             "",
           ].join("\n");
-          const reflectionBody = `${header}${reflectionText.trim()}\n`;
+          const graphSnapshotSuffix = graphReflectionContext?.snapshotBlock
+            ? `\n\n${graphReflectionContext.snapshotBlock}\n`
+            : "\n";
+          const reflectionBody = `${header}${reflectionText.trim()}${graphSnapshotSuffix}`;
 
           const outDir = join(workspaceDir, "memory", "reflections", dateStr);
           await mkdir(outDir, { recursive: true });
@@ -1895,6 +1964,82 @@ const memoryLanceDBProPlugin = {
             command: String(event.action || "unknown"),
           });
 
+          const graphInferenceCandidates = graphReflectionContext?.inferredCandidates ?? [];
+          for (const candidate of graphInferenceCandidates) {
+            const inferredText = `[graph-inferred] ${candidate.text}`;
+            const inferredVector = await embedder.embedPassage(inferredText);
+            let inferredExisting: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            try {
+              inferredExisting = await store.vectorSearch(inferredVector, 1, 0.1, [targetScope]);
+            } catch (err) {
+              api.logger.warn(
+                `memory-reflection: graph inference duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+
+            if (inferredExisting.length > 0 && inferredExisting[0].score > 0.97) {
+              continue;
+            }
+
+            const inferredMetadata = JSON.stringify({
+              source: "graphiti_inference",
+              assertionKind: "inferred",
+              confidence: candidate.confidence,
+              evidenceFact: candidate.evidenceFact,
+              reflectionEventId,
+              sessionKey,
+              sessionId: currentSessionId || "unknown",
+              agentId: sourceAgentId,
+              scope: targetScope,
+              sourceReflectionPath: relPath,
+              runAt: nowTs,
+            });
+
+            const inferredEntry = await store.store({
+              text: inferredText,
+              vector: inferredVector,
+              importance: Math.max(0.45, Math.min(0.75, candidate.confidence)),
+              category: "fact",
+              scope: targetScope,
+              metadata: inferredMetadata,
+            });
+
+            if (graphitiSync.isEnabled("memoryStore")) {
+              await graphitiSync.syncMemory(
+                {
+                  id: inferredEntry.id,
+                  text: inferredText,
+                  scope: targetScope,
+                  category: inferredEntry.category,
+                  metadata: inferredEntry.metadata,
+                },
+                {
+                  mode: "memoryStore",
+                  source: "graphiti:inference",
+                  agentId: sourceAgentId,
+                  mutation: "graph_inference",
+                  extraMetadata: {
+                    reflectionEventId,
+                    confidence: candidate.confidence,
+                    evidenceFact: candidate.evidenceFact,
+                  },
+                },
+              );
+            }
+
+            if (mdMirror) {
+              await mdMirror(
+                {
+                  text: inferredText,
+                  category: inferredEntry.category,
+                  scope: targetScope,
+                  timestamp: inferredEntry.timestamp,
+                },
+                { source: "graphiti:inference", agentId: sourceAgentId },
+              );
+            }
+          }
+
           const mappedReflectionMemories = extractReflectionMappedMemoryItems(reflectionText);
           for (const mapped of mappedReflectionMemories) {
             const vector = await embedder.embedPassage(mapped.text);
@@ -1933,6 +2078,28 @@ const memoryLanceDBProPlugin = {
               metadata,
             });
 
+            if (graphitiSync.isEnabled("memoryStore")) {
+              await graphitiSync.syncMemory(
+                {
+                  id: storedEntry.id,
+                  text: mapped.text,
+                  scope: targetScope,
+                  category: mapped.category,
+                  metadata: storedEntry.metadata,
+                },
+                {
+                  mode: "memoryStore",
+                  source: `reflection:${mapped.heading}`,
+                  agentId: sourceAgentId,
+                  mutation: "reflection_mapped_store",
+                  extraMetadata: {
+                    reflectionEventId,
+                    reflectionPath: relPath,
+                  },
+                },
+              );
+            }
+
             if (mdMirror) {
               await mdMirror(
                 { text: mapped.text, category: mapped.category, scope: targetScope, timestamp: storedEntry.timestamp },
@@ -1965,6 +2132,10 @@ const memoryLanceDBProPlugin = {
           const dailyPath = join(workspaceDir, "memory", `${dateStr}.md`);
           await ensureDailyLogFile(dailyPath, dateStr);
           await appendFile(dailyPath, `- [${timeHms} UTC] Reflection generated: \`${relPath}\`\n`, "utf-8");
+
+          if (config.workspaceDocs?.refreshOnReflection) {
+            void refreshWorkspaceDocs("reflection");
+          }
 
           api.logger.info(`memory-reflection: wrote ${relPath} for session ${currentSessionId}`);
         } catch (err) {
@@ -2032,6 +2203,8 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
+    let workspaceDocsTimer: ReturnType<typeof setInterval> | null = null;
+    let graphInferenceTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
@@ -2155,6 +2328,29 @@ const memoryLanceDBProPlugin = {
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+
+        if (workspaceDocs && config.workspaceDocs?.enabled) {
+          setTimeout(() => void refreshWorkspaceDocs("startup"), 75_000);
+          workspaceDocsTimer = setInterval(
+            () => void refreshWorkspaceDocs("scheduled"),
+            config.workspaceDocs.intervalMs,
+          );
+        }
+
+        if (config.graphiti?.enabled && config.graphiti.inference.enabled) {
+          setTimeout(async () => {
+            const result = await runGraphInferenceJob({ reason: "startup" });
+            if (result.stored > 0) {
+              await refreshWorkspaceDocs("graph_inference_startup");
+            }
+          }, 90_000);
+          graphInferenceTimer = setInterval(async () => {
+            const result = await runGraphInferenceJob({ reason: "scheduled" });
+            if (result.stored > 0) {
+              await refreshWorkspaceDocs("graph_inference_scheduled");
+            }
+          }, config.graphiti.inference.intervalMs);
+        }
       },
       stop: async () => {
         // Flush pending access reinforcement data before shutdown
@@ -2168,6 +2364,14 @@ const memoryLanceDBProPlugin = {
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
+        }
+        if (workspaceDocsTimer) {
+          clearInterval(workspaceDocsTimer);
+          workspaceDocsTimer = null;
+        }
+        if (graphInferenceTimer) {
+          clearInterval(graphInferenceTimer);
+          graphInferenceTimer = null;
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
@@ -2302,6 +2506,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     typeof cfg.graphiti === "object" && cfg.graphiti !== null
       ? (cfg.graphiti as Record<string, unknown>)
       : undefined;
+  const workspaceDocsRaw =
+    typeof cfg.workspaceDocs === "object" && cfg.workspaceDocs !== null
+      ? (cfg.workspaceDocs as Record<string, unknown>)
+      : undefined;
 
   const graphiti: GraphitiPluginConfig | undefined = graphitiRaw
     ? {
@@ -2309,7 +2517,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         baseUrl:
           typeof graphitiRaw.baseUrl === "string" && graphitiRaw.baseUrl.trim().length > 0
             ? resolveEnvVars(graphitiRaw.baseUrl)
-            : "http://localhost:8001",
+            : "http://localhost:8000",
         transport:
           graphitiRaw.transport === "mcp" || graphitiRaw.transport === "auto"
             ? graphitiRaw.transport
@@ -2321,6 +2529,38 @@ export function parsePluginConfig(value: unknown): PluginConfig {
             : undefined,
         timeoutMs: parsePositiveInt(graphitiRaw.timeoutMs) ?? 4000,
         failOpen: parseBoolean(graphitiRaw.failOpen, true),
+        auth: (() => {
+          const authRaw =
+            typeof graphitiRaw.auth === "object" && graphitiRaw.auth !== null
+              ? (graphitiRaw.auth as Record<string, unknown>)
+              : undefined;
+          if (!authRaw) return undefined;
+
+          const tokenFromConfig =
+            typeof authRaw.token === "string" && authRaw.token.trim().length > 0
+              ? resolveEnvVars(authRaw.token).trim()
+              : undefined;
+          const tokenEnv =
+            typeof authRaw.tokenEnv === "string" && authRaw.tokenEnv.trim().length > 0
+              ? authRaw.tokenEnv.trim()
+              : undefined;
+          const tokenFromEnv = tokenEnv
+            ? process.env[tokenEnv]
+            : undefined;
+          const token = tokenFromConfig ||
+            (typeof tokenFromEnv === "string" && tokenFromEnv.trim().length > 0
+              ? tokenFromEnv.trim()
+              : undefined);
+          const headerName =
+            typeof authRaw.headerName === "string" && authRaw.headerName.trim().length > 0
+              ? authRaw.headerName.trim()
+              : "authorization";
+          return {
+            token,
+            tokenEnv,
+            headerName,
+          };
+        })(),
         write: (() => {
           const writeRaw =
             typeof graphitiRaw.write === "object" && graphitiRaw.write !== null
@@ -2344,8 +2584,36 @@ export function parsePluginConfig(value: unknown): PluginConfig {
             topKFacts: parsePositiveInt(readRaw.topKFacts) ?? 10,
           };
         })(),
+        inference: (() => {
+          const inferenceRaw =
+            typeof graphitiRaw.inference === "object" && graphitiRaw.inference !== null
+              ? (graphitiRaw.inference as Record<string, unknown>)
+              : {};
+          const maxMemories = parsePositiveInt(inferenceRaw.maxMemories) ?? 120;
+          const maxScopes = parsePositiveInt(inferenceRaw.maxScopes) ?? 6;
+          const minConfidenceRaw = parseNumber(inferenceRaw.minConfidence);
+          return {
+            enabled: parseBoolean(inferenceRaw.enabled, false),
+            intervalMs: parsePositiveInt(inferenceRaw.intervalMs) ?? 45 * 60 * 1000,
+            maxMemories: Math.min(1000, Math.max(20, maxMemories)),
+            minConfidence: Math.min(1, Math.max(0, minConfidenceRaw ?? 0.62)),
+            maxScopes: Math.min(20, Math.max(1, maxScopes)),
+            includeScopes: parseStringList(inferenceRaw.includeScopes),
+            excludeScopes: parseStringList(inferenceRaw.excludeScopes),
+          };
+        })(),
       }
     : undefined;
+
+  const workspaceDocs = {
+    enabled: workspaceDocsRaw?.enabled === true,
+    intervalMs: parsePositiveInt(workspaceDocsRaw?.intervalMs) ?? 30 * 60 * 1000,
+    markerPrefix:
+      typeof workspaceDocsRaw?.markerPrefix === "string" && workspaceDocsRaw.markerPrefix.trim().length > 0
+        ? workspaceDocsRaw.markerPrefix.trim()
+        : "memory-lancedb-pro",
+    refreshOnReflection: parseBoolean(workspaceDocsRaw?.refreshOnReflection, true),
+  };
 
   return {
     embedding: {
@@ -2388,11 +2656,6 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallExcludeReflection: parseBoolean(cfg.autoRecallExcludeReflection, true),
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
-    autoRecallTopK: parsePositiveInt(cfg.autoRecallTopK) ?? DEFAULT_AUTO_RECALL_TOP_K,
-    autoRecallCategories: parseMemoryCategories(cfg.autoRecallCategories, DEFAULT_AUTO_RECALL_CATEGORIES),
-    autoRecallExcludeReflection: typeof cfg.autoRecallExcludeReflection === "boolean"
-      ? cfg.autoRecallExcludeReflection
-      : DEFAULT_AUTO_RECALL_EXCLUDE_REFLECTION,
     autoRecallMaxAgeDays: parsePositiveInt(cfg.autoRecallMaxAgeDays) ?? DEFAULT_AUTO_RECALL_MAX_AGE_DAYS,
     autoRecallMaxEntriesPerKey: parsePositiveInt(cfg.autoRecallMaxEntriesPerKey) ?? DEFAULT_AUTO_RECALL_MAX_ENTRIES_PER_KEY,
     captureAssistant: cfg.captureAssistant === true,
@@ -2427,6 +2690,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       recall: reflectionRecall,
     },
     graphiti,
+    workspaceDocs,
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
         ? {

@@ -1,6 +1,12 @@
 export type GraphitiTransportMode = "auto" | "mcp";
 export type GraphitiGroupIdMode = "scope" | "fixed";
 
+export interface GraphitiAuthConfig {
+  token?: string;
+  tokenEnv?: string;
+  headerName: string;
+}
+
 export interface GraphitiWriteConfig {
   memoryStore: boolean;
   autoCapture: boolean;
@@ -14,6 +20,16 @@ export interface GraphitiReadConfig {
   topKFacts: number;
 }
 
+export interface GraphitiInferenceConfig {
+  enabled: boolean;
+  intervalMs: number;
+  maxMemories: number;
+  minConfidence: number;
+  maxScopes: number;
+  includeScopes?: string[];
+  excludeScopes?: string[];
+}
+
 export interface GraphitiPluginConfig {
   enabled: boolean;
   baseUrl: string;
@@ -22,8 +38,10 @@ export interface GraphitiPluginConfig {
   fixedGroupId?: string;
   timeoutMs: number;
   failOpen: boolean;
+  auth?: GraphitiAuthConfig;
   write: GraphitiWriteConfig;
   read: GraphitiReadConfig;
+  inference: GraphitiInferenceConfig;
 }
 
 export interface GraphitiEpisodeInput {

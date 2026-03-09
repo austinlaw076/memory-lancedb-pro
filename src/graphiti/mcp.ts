@@ -17,6 +17,16 @@ interface JsonRpcResponse {
   error?: JsonRpcError;
 }
 
+interface JsonRpcHttpResult {
+  body: JsonRpcResponse;
+  headers: Headers;
+}
+
+interface PostJsonRpcOptions {
+  sessionId?: string;
+  allowEmptyBody?: boolean;
+}
+
 interface McpToolDescriptor {
   name?: string;
   description?: string;
@@ -25,10 +35,14 @@ interface McpToolDescriptor {
 
 export class GraphitiMcpClient {
   private endpoint: string | null = null;
+  private sessionId: string | null = null;
   private toolCache: McpToolDescriptor[] = [];
+  private initializePromise: Promise<void> | null = null;
+  private toolDiscoveryPromise: Promise<McpToolDescriptor[]> | null = null;
+  private requestCounter = 0;
 
   constructor(
-    private readonly config: Pick<GraphitiPluginConfig, "baseUrl" | "timeoutMs" | "transport">,
+    private readonly config: Pick<GraphitiPluginConfig, "baseUrl" | "timeoutMs" | "transport" | "auth">,
     private readonly logger?: LoggerLike,
   ) {}
 
@@ -37,63 +51,73 @@ export class GraphitiMcpClient {
       return this.toolCache;
     }
 
-    const result = (await this.callMcp("tools/list", undefined, true)) as Record<string, unknown>;
-    const tools = Array.isArray(result.tools) ? (result.tools as McpToolDescriptor[]) : [];
-    this.toolCache = tools;
-    return this.toolCache;
+    if (!forceRefresh && this.toolDiscoveryPromise) {
+      return this.toolDiscoveryPromise;
+    }
+
+    this.toolDiscoveryPromise = (async () => {
+      const result = (await this.callMcp("tools/list", {})) as Record<string, unknown>;
+      const tools = Array.isArray(result.tools) ? (result.tools as McpToolDescriptor[]) : [];
+      this.toolCache = tools;
+      return this.toolCache;
+    })();
+
+    try {
+      return await this.toolDiscoveryPromise;
+    } finally {
+      this.toolDiscoveryPromise = null;
+    }
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-    return this.callMcp("tools/call", { name, arguments: args }, false);
+    return this.callMcp("tools/call", { name, arguments: args });
   }
 
-  private async callMcp(
-    method: string,
-    params: Record<string, unknown> | undefined,
-    allowEndpointProbe: boolean,
-  ): Promise<unknown> {
-    const endpoint = await this.resolveEndpoint(allowEndpointProbe);
-    const payload = {
-      jsonrpc: "2.0",
-      id: `graphiti-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      method,
-      params,
-    };
-
-    const response = await this.postJsonRpc(endpoint, payload, this.config.timeoutMs);
-    if (response.error) {
+  private async callMcp(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    const endpoint = await this.resolveEndpoint();
+    const payload = this.buildRequest(method, params);
+    const { body } = await this.postJsonRpc(endpoint, payload, this.config.timeoutMs, {
+      sessionId: this.sessionId || undefined,
+      allowEmptyBody: false,
+    });
+    if (body.error) {
       throw new Error(
-        `Graphiti MCP ${method} failed: ${response.error.message || "unknown_error"} (code=${String(response.error.code ?? "n/a")})`,
+        `Graphiti MCP ${method} failed: ${body.error.message || "unknown_error"} (code=${String(body.error.code ?? "n/a")})`,
       );
     }
-    return response.result;
+    return body.result;
   }
 
-  private async resolveEndpoint(allowProbe: boolean): Promise<string> {
-    if (!allowProbe && this.endpoint) {
+  private async resolveEndpoint(): Promise<string> {
+    if (this.endpoint) {
       return this.endpoint;
     }
 
+    if (this.initializePromise) {
+      await this.initializePromise;
+      if (this.endpoint) return this.endpoint;
+    }
+
+    this.initializePromise = this.initialize();
+    try {
+      await this.initializePromise;
+    } finally {
+      this.initializePromise = null;
+    }
+
+    if (this.endpoint) return this.endpoint;
+    throw new Error("Graphiti MCP endpoint resolution failed without a specific error");
+  }
+
+  private async initialize(): Promise<void> {
     const candidates = this.endpointCandidates();
     let lastError: unknown = null;
     for (const candidate of candidates) {
       try {
-        const response = await this.postJsonRpc(
-          candidate,
-          {
-            jsonrpc: "2.0",
-            id: `graphiti-probe-${Date.now()}`,
-            method: "tools/list",
-            params: {},
-          },
-          this.config.timeoutMs,
-        );
-        if (response.error) {
-          throw new Error(response.error.message || "tools/list returned error");
-        }
+        await this.performInitialize(candidate);
         this.endpoint = candidate;
         this.logger?.debug?.(`memory-lancedb-pro: graphiti endpoint selected: ${candidate}`);
-        return candidate;
+        return;
       } catch (err) {
         lastError = err;
       }
@@ -102,6 +126,62 @@ export class GraphitiMcpClient {
     throw new Error(
       `Graphiti MCP endpoint unavailable under ${this.config.baseUrl}. Last error: ${String(lastError)}`,
     );
+  }
+
+  private async performInitialize(endpoint: string): Promise<void> {
+    const initializePayload = this.buildRequest("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: {
+        name: "memory-lancedb-pro",
+        version: "1.1.0",
+      },
+    });
+
+    const initializeResponse = await this.postJsonRpc(
+      endpoint,
+      initializePayload,
+      this.config.timeoutMs,
+      { allowEmptyBody: false },
+    );
+
+    if (initializeResponse.body.error) {
+      throw new Error(
+        initializeResponse.body.error.message || "initialize failed",
+      );
+    }
+
+    const nextSessionId = initializeResponse.headers.get("mcp-session-id");
+    this.sessionId = nextSessionId && nextSessionId.trim().length > 0
+      ? nextSessionId.trim()
+      : null;
+
+    const initializedPayload = this.buildRequest("notifications/initialized", {});
+    const initializedResponse = await this.postJsonRpc(
+      endpoint,
+      initializedPayload,
+      this.config.timeoutMs,
+      {
+        sessionId: this.sessionId || undefined,
+        allowEmptyBody: true,
+      },
+    );
+
+    if (initializedResponse.body.error) {
+      throw new Error(
+        initializedResponse.body.error.message || "notifications/initialized failed",
+      );
+    }
+  }
+
+  private buildRequest(method: string, params: Record<string, unknown>) {
+    const id = `graphiti-${Date.now()}-${this.requestCounter++}`;
+    return {
+      jsonrpc: "2.0",
+      id,
+      method,
+      params,
+    };
   }
 
   private endpointCandidates(): string[] {
@@ -116,17 +196,24 @@ export class GraphitiMcpClient {
     url: string,
     payload: Record<string, unknown>,
     timeoutMs: number,
-  ): Promise<JsonRpcResponse> {
+    options: PostJsonRpcOptions = {},
+  ): Promise<JsonRpcHttpResult> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      accept: "application/json",
+      ...this.resolveAuthHeaders(),
+    };
+    if (options.sessionId) {
+      headers["mcp-session-id"] = options.sessionId;
+    }
 
     try {
       const response = await fetch(url, {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json",
-        },
+        headers,
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
@@ -134,9 +221,77 @@ export class GraphitiMcpClient {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
       }
-      return (await response.json()) as JsonRpcResponse;
+
+      const bodyText = await response.text();
+      if (!bodyText.trim()) {
+        if (options.allowEmptyBody) {
+          return { body: {}, headers: response.headers };
+        }
+        throw new Error("Empty JSON-RPC response body");
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(bodyText);
+      } catch (err) {
+        throw new Error(
+          `Invalid JSON-RPC response body: ${String(err)}`,
+        );
+      }
+
+      if (Array.isArray(parsed)) {
+        const first = parsed.find((item) => item && typeof item === "object");
+        if (!first) {
+          if (options.allowEmptyBody) return { body: {}, headers: response.headers };
+          throw new Error("Invalid JSON-RPC batch response: empty array");
+        }
+        return {
+          body: first as JsonRpcResponse,
+          headers: response.headers,
+        };
+      }
+
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error("Invalid JSON-RPC response payload type");
+      }
+
+      return {
+        body: parsed as JsonRpcResponse,
+        headers: response.headers,
+      };
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  private resolveAuthHeaders(): Record<string, string> {
+    const auth = this.config.auth;
+    if (!auth) return {};
+
+    const tokenFromConfig =
+      typeof auth.token === "string" && auth.token.trim().length > 0
+        ? auth.token.trim()
+        : undefined;
+    const tokenFromEnv =
+      typeof auth.tokenEnv === "string" && auth.tokenEnv.trim().length > 0
+        ? process.env[auth.tokenEnv.trim()]
+        : undefined;
+    const token = tokenFromConfig ||
+      (typeof tokenFromEnv === "string" && tokenFromEnv.trim().length > 0
+        ? tokenFromEnv.trim()
+        : undefined);
+    if (!token) return {};
+
+    const headerName =
+      typeof auth.headerName === "string" && auth.headerName.trim().length > 0
+        ? auth.headerName.trim()
+        : "authorization";
+    const value =
+      headerName.toLowerCase() === "authorization" && !/^(bearer|token)\s+/i.test(token)
+        ? `Bearer ${token}`
+        : token;
+    return {
+      [headerName]: value,
+    };
   }
 }

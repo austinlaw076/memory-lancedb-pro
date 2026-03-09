@@ -260,6 +260,23 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - `mdMirror.enabled`: enable/disable dual-write (`false` by default).
   - `mdMirror.dir`: fallback directory for Markdown mirror files.
 
+### 10.1 Workspace Docs Materializer (`workspaceDocs`)
+
+- Purpose:
+  - Maintain plugin-managed sections inside shared workspace markdown files.
+  - Files: `USER.md`, `AGENTS.md`, `IDENTITY.md`, `MEMORY.md`, `SOUL.md`, `HEARTBEAT.md`, `TOOLS.md`.
+- Safety:
+  - Conservative mode by default.
+  - Only marker-scoped blocks are updated; user-authored content outside markers is preserved.
+- Triggers:
+  - Scheduled refresh (`workspaceDocs.intervalMs`).
+  - Optional refresh after reflection (`workspaceDocs.refreshOnReflection`).
+- Config:
+  - `workspaceDocs.enabled`: enable/disable materialization (`false` by default).
+  - `workspaceDocs.intervalMs`: periodic refresh interval in ms (default: `1800000`).
+  - `workspaceDocs.markerPrefix`: marker prefix for managed blocks (default: `memory-lancedb-pro`).
+  - `workspaceDocs.refreshOnReflection`: refresh docs after reflection writes (`true` by default).
+
 ### 11. Long Context Chunking
 
 Automatically handles documents that exceed embedding model context limits:
@@ -297,7 +314,20 @@ When embedding calls fail, the plugin provides **actionable error messages** ins
 - Keep LanceDB as the primary memory store.
 - Optionally mirror successful `memory_store` writes to Graphiti (`add_episode`) using `scope -> group_id`.
 - Expose graph-native recall via `memory_graph_recall` (separate from `memory_recall`).
+- Reflection can consume Graphiti context snapshots and write low-confidence graph-inferred candidates back to memory.
+- Optional scheduled graph inference job can run independently of reflection and write inferred candidates.
 - Fail-open behavior: Graphiti outages do not fail `memory_store`.
+
+Operational CLI commands:
+
+- `memory-pro graph-doctor [--json] [--scope <scope>] [--limit <n>]`
+- `memory-pro graph-infer --once [--dry-run] [--scope <scope>] [--include-scopes <csv>] [--exclude-scopes <csv>]`
+- `memory-pro graph-sync --mode backfill|resync [--dry-run] [--scope <scope>] [--limit <n>]`
+- `memory-pro graph-import --mode recall|list [--scope <scope>] [--query <query>] [--dry-run]`
+- `memory-pro promotion-queue [--scope <scope>] [--limit <n>] [--json]`
+- `memory-pro promotion-approve <id> [--target USER|AGENTS|IDENTITY|SOUL]`
+- `memory-pro promotion-reject <id> [--reason <reason>]`
+- `memory-pro docs-refresh [--workspace <path>] [--reason <label>]`
 
 Minimal config:
 
@@ -325,6 +355,39 @@ Minimal config:
               "augmentMemoryRecall": false,
               "topKNodes": 6,
               "topKFacts": 10
+            },
+            "inference": {
+              "enabled": false,
+              "intervalMs": 2700000,
+              "maxMemories": 120,
+              "minConfidence": 0.62,
+              "maxScopes": 6,
+              "includeScopes": ["global"],
+              "excludeScopes": ["agent:experimental"]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Optional auth config (if your Graphiti MCP endpoint requires a token):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "enabled": true,
+        "config": {
+          "graphiti": {
+            "enabled": true,
+            "baseUrl": "http://localhost:8000",
+            "auth": {
+              "token": "${GRAPHITI_API_TOKEN}",
+              "headerName": "authorization"
             }
           }
         }

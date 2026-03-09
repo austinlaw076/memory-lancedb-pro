@@ -16,6 +16,7 @@ import type { MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
 import type { GraphitiBridge } from "./graphiti/bridge.js";
 import type { GraphitiPluginConfig } from "./graphiti/types.js";
+import type { GraphitiSyncService } from "./graphiti/sync.js";
 import { registerMemoryGraphRecallTool } from "./tools-graphiti.js";
 import { ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
 
@@ -44,6 +45,7 @@ interface ToolContext {
   embedder: Embedder;
   workspaceDir?: string;
   graphitiBridge?: GraphitiBridge;
+  graphitiSync?: GraphitiSyncService;
   graphitiConfig?: GraphitiPluginConfig;
   logger?: {
     warn?: (message: string) => void;
@@ -76,6 +78,10 @@ function clampInt(value: number, min: number, max: number): number {
 function clamp01(value: number, fallback = 0.7): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.min(1, Math.max(0, value));
+}
+
+function isFullUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
 function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
@@ -396,6 +402,23 @@ export function registerMemoryStoreTool(
             | undefined;
 
           if (
+            context.graphitiSync
+          ) {
+            graphitiDetails = await context.graphitiSync.syncMemory(
+              {
+                id: entry.id,
+                text,
+                scope: targetScope,
+                category: entry.category,
+                metadata: entry.metadata,
+              },
+              {
+                mode: "memoryStore",
+                source: "memory_store",
+                mutation: "memory_store",
+              },
+            );
+          } else if (
             context.graphitiBridge &&
             context.graphitiConfig?.enabled &&
             context.graphitiConfig.write.memoryStore
@@ -430,6 +453,22 @@ export function registerMemoryStoreTool(
               } catch (err) {
                 context.logger?.warn?.(`memory-lancedb-pro: graphiti metadata update failed: ${String(err)}`);
               }
+            }
+          }
+
+          if (context.mdMirror) {
+            try {
+              await context.mdMirror(
+                {
+                  text,
+                  category: entry.category,
+                  scope: entry.scope,
+                  timestamp: entry.timestamp,
+                },
+                { source: "memory_store", agentId },
+              );
+            } catch (err) {
+              context.logger?.warn?.(`memory-lancedb-pro: memory_store mdMirror failed: ${String(err)}`);
             }
           }
 
@@ -500,6 +539,48 @@ export function registerMemoryForgetTool(
         };
 
         try {
+          const recordGraphitiForget = async (payload: {
+            memoryId: string;
+            scope: string;
+            text?: string;
+            mode: "memoryId" | "query-auto";
+          }) => {
+            if (context.graphitiSync) {
+              return await context.graphitiSync.recordEvent({
+                mode: "memoryStore",
+                source: "memory_forget",
+                scope: payload.scope,
+                text: payload.text
+                  ? `Memory forgotten: ${payload.text}`
+                  : `Memory forgotten: id=${payload.memoryId}`,
+                metadata: {
+                  mode: payload.mode,
+                  memoryId: payload.memoryId,
+                },
+              });
+            }
+
+            if (
+              !context.graphitiBridge ||
+              !context.graphitiConfig?.enabled ||
+              !context.graphitiConfig.write.memoryStore
+            ) {
+              return undefined;
+            }
+
+            return await context.graphitiBridge.addEpisode({
+              text: payload.text
+                ? `Memory forgotten: ${payload.text}`
+                : `Memory forgotten: id=${payload.memoryId}`,
+              scope: payload.scope,
+              metadata: {
+                source: "memory_forget",
+                mode: payload.mode,
+                memoryId: payload.memoryId,
+              },
+            });
+          };
+
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
@@ -519,13 +600,33 @@ export function registerMemoryForgetTool(
           }
 
           if (memoryId) {
+            let originalScope = scopeFilter[0] || context.scopeManager.getDefaultScope(agentId);
+            let originalText: string | undefined;
+            if (isFullUuid(memoryId)) {
+              try {
+                const existing = await context.store.getById(memoryId);
+                if (existing) {
+                  originalScope = existing.scope;
+                  originalText = existing.text;
+                }
+              } catch {
+                // Ignore lookup failures and continue delete flow.
+              }
+            }
+
             const deleted = await context.store.delete(memoryId, scopeFilter);
             if (deleted) {
+              const graphiti = await recordGraphitiForget({
+                memoryId,
+                scope: originalScope,
+                text: originalText,
+                mode: "memoryId",
+              });
               return {
                 content: [
                   { type: "text", text: `Memory ${memoryId} forgotten.` },
                 ],
-                details: { action: "deleted", id: memoryId },
+                details: { action: "deleted", id: memoryId, graphiti },
               };
             } else {
               return {
@@ -557,19 +658,26 @@ export function registerMemoryForgetTool(
             }
 
             if (results.length === 1 && results[0].score > 0.9) {
+              const candidate = results[0].entry;
               const deleted = await context.store.delete(
-                results[0].entry.id,
+                candidate.id,
                 scopeFilter,
               );
               if (deleted) {
+                const graphiti = await recordGraphitiForget({
+                  memoryId: candidate.id,
+                  scope: candidate.scope,
+                  text: candidate.text,
+                  mode: "query-auto",
+                });
                 return {
                   content: [
                     {
                       type: "text",
-                      text: `Forgotten: "${results[0].entry.text}"`,
+                      text: `Forgotten: "${candidate.text}"`,
                     },
                   ],
-                  details: { action: "deleted", id: results[0].entry.id },
+                  details: { action: "deleted", id: candidate.id, graphiti },
                 };
               }
             }
@@ -764,6 +872,75 @@ export function registerMemoryUpdateTool(
             };
           }
 
+          let graphitiDetails:
+            | {
+                status: "stored" | "failed" | "skipped";
+                groupId: string;
+                episodeRef?: string;
+                error?: string;
+              }
+            | undefined;
+
+          if (
+            context.graphitiSync
+          ) {
+            graphitiDetails = await context.graphitiSync.syncMemory(
+              {
+                id: updated.id,
+                text: updated.text,
+                scope: updated.scope,
+                category: updated.category,
+                metadata: updated.metadata,
+              },
+              {
+                mode: "memoryStore",
+                source: "memory_update",
+                mutation: "memory_update",
+                extraMetadata: {
+                  fieldsUpdated: Object.keys(updates),
+                },
+              },
+            );
+          } else if (
+            context.graphitiBridge &&
+            context.graphitiConfig?.enabled &&
+            context.graphitiConfig.write.memoryStore
+          ) {
+            graphitiDetails = await context.graphitiBridge.addEpisode({
+              text: updated.text,
+              scope: updated.scope,
+              metadata: {
+                source: "memory_update",
+                memoryId: updated.id,
+                category: updated.category,
+                scope: updated.scope,
+                fieldsUpdated: Object.keys(updates),
+              },
+            });
+
+            if (graphitiDetails.status !== "skipped") {
+              try {
+                const currentMetadata = safeParseJson(updated.metadata);
+                const nextMetadata = {
+                  ...currentMetadata,
+                  graphiti: {
+                    groupId: graphitiDetails.groupId,
+                    episodeRef: graphitiDetails.episodeRef,
+                    status: graphitiDetails.status,
+                    error: graphitiDetails.error,
+                    lastMutation: "memory_update",
+                    updatedAt: new Date().toISOString(),
+                  },
+                };
+                const metadata = JSON.stringify(nextMetadata);
+                await context.store.update(updated.id, { metadata }, [updated.scope]);
+                updated.metadata = metadata;
+              } catch (err) {
+                context.logger?.warn?.(`memory-lancedb-pro: memory_update graphiti metadata update failed: ${String(err)}`);
+              }
+            }
+          }
+
           return {
             content: [
               {
@@ -778,6 +955,7 @@ export function registerMemoryUpdateTool(
               category: updated.category,
               importance: updated.importance,
               fieldsUpdated: Object.keys(updates),
+              graphiti: graphitiDetails,
             },
           };
         } catch (error) {
