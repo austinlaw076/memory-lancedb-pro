@@ -1,3 +1,4 @@
+import logger from "./logger.js";
 /**
  * Hybrid Retrieval System
  * Combines vector search + BM25 full-text search with RRF fusion
@@ -638,7 +639,7 @@ export class MemoryRetriever {
           const parsed = parseRerankResponse(provider, data);
 
           if (!parsed) {
-            console.warn(
+            logger.warn(
               "Rerank API: invalid response shape, falling back to cosine",
             );
           } else {
@@ -675,15 +676,15 @@ export class MemoryRetriever {
           }
         } else {
           const errText = await response.text().catch(() => "");
-          console.warn(
+          logger.warn(
             `Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`,
           );
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
-          console.warn("Rerank API timed out (5s), falling back to cosine");
+          logger.warn("Rerank API timed out (5s), falling back to cosine");
         } else {
-          console.warn("Rerank API failed, falling back to cosine:", error);
+          logger.warn("Rerank API failed, falling back to cosine:", error);
         }
       }
     }
@@ -706,7 +707,7 @@ export class MemoryRetriever {
 
       return reranked.sort((a, b) => b.score - a.score);
     } catch (error) {
-      console.warn("Reranking failed, returning original results:", error);
+      logger.warn("Reranking failed, returning original results:", error);
       return results;
     }
   }

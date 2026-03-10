@@ -4,7 +4,7 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { stringEnum } from "openclaw/plugin-sdk";
+const stringEnum = <T extends readonly string[]>(values: T) => Type.Unsafe<T[number]>({ type: "string", enum: values as unknown as string[] });
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -19,6 +19,7 @@ import type { GraphitiPluginConfig } from "./graphiti/types.js";
 import type { GraphitiSyncService } from "./graphiti/sync.js";
 import { registerMemoryGraphRecallTool } from "./tools-graphiti.js";
 import { ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
+import { getDisplayCategoryTag } from "./reflection-metadata.js";
 
 // ============================================================================
 // Types

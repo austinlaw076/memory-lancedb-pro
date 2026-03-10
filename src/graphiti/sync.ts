@@ -55,6 +55,7 @@ export class GraphitiSyncService {
     const result = await this.options.bridge!.addEpisode({
       text: memory.text,
       scope: memory.scope,
+      category: memory.category,
       metadata: {
         source: options.source,
         agentId: options.agentId,
@@ -111,6 +112,7 @@ export class GraphitiSyncService {
     return await this.options.bridge!.addEpisode({
       text: input.text,
       scope: input.scope,
+      category: "reflection", // default to agent/reflection graph
       metadata: {
         source: input.source,
         scope: input.scope,

@@ -2342,7 +2342,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           graphitiRaw.transport === "mcp" || graphitiRaw.transport === "auto"
             ? graphitiRaw.transport
             : "auto",
-        groupIdMode: graphitiRaw.groupIdMode === "fixed" ? "fixed" : "scope",
+        groupIdMode: graphitiRaw.groupIdMode === "routing" ? "routing" : graphitiRaw.groupIdMode === "fixed" ? "fixed" : "scope",
         fixedGroupId:
           typeof graphitiRaw.fixedGroupId === "string" && graphitiRaw.fixedGroupId.trim().length > 0
             ? graphitiRaw.fixedGroupId.trim()

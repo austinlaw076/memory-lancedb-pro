@@ -13,6 +13,7 @@ import {
   lstatSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import logger from "./logger.js";
 
 // ============================================================================
 // Types
@@ -204,12 +205,12 @@ export class MemoryStore {
       try {
         const sample = await table.query().limit(1).toArray();
         if (sample.length > 0 && !("scope" in sample[0])) {
-          console.warn(
+          logger.warn(
             "Adding scope column for backward compatibility with existing data",
           );
         }
       } catch (err) {
-        console.warn("Could not check table schema:", err);
+        logger.warn("Could not check table schema:", err);
       }
     } catch (_openErr) {
       // Table doesn't exist yet — create it
@@ -258,7 +259,7 @@ export class MemoryStore {
       await this.createFtsIndex(table);
       this.ftsIndexCreated = true;
     } catch (err) {
-      console.warn(
+      logger.warn(
         "Failed to create FTS index, falling back to vector-only search:",
         err,
       );
@@ -511,7 +512,7 @@ export class MemoryStore {
 
       return mapped;
     } catch (err) {
-      console.warn("BM25 search failed, falling back to empty results:", err);
+      logger.warn("BM25 search failed, falling back to empty results:", err);
       return [];
     }
   }

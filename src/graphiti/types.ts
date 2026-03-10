@@ -1,5 +1,5 @@
 export type GraphitiTransportMode = "auto" | "mcp";
-export type GraphitiGroupIdMode = "scope" | "fixed";
+export type GraphitiGroupIdMode = "scope" | "fixed" | "routing";
 
 export interface GraphitiAuthConfig {
   token?: string;
@@ -47,6 +47,7 @@ export interface GraphitiPluginConfig {
 export interface GraphitiEpisodeInput {
   text: string;
   scope: string;
+  category?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -79,7 +80,7 @@ export interface GraphitiRecallInput {
 }
 
 export interface GraphitiRecallResult {
-  groupId: string;
+  groupIds: string[];
   nodes: GraphitiNodeResult[];
   facts: GraphitiFactResult[];
 }

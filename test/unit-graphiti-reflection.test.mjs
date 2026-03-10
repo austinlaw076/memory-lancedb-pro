@@ -14,7 +14,7 @@ test("buildGraphReflectionContext builds context and inferred candidates", async
     limitFacts: 10,
     bridge: {
       recall: async () => ({
-        groupId: "global",
+        groupIds: ["user", "knowledge"],
         nodes: [{ label: "Alice" }, { label: "Tea" }],
         facts: [{ text: "Alice likes tea" }],
       }),
@@ -22,8 +22,9 @@ test("buildGraphReflectionContext builds context and inferred candidates", async
   });
 
   assert.ok(result);
-  assert.equal(result.groupId, "global");
+  assert.deepEqual(result.groupIds, ["user", "knowledge"]);
   assert.match(result.contextBlock, /<graph-context>/);
+  assert.match(result.contextBlock, /group_ids: user,knowledge/);
   assert.match(result.contextBlock, /Alice likes tea/);
   assert.equal(result.inferredCandidates.length, 1);
   assert.match(result.inferredCandidates[0].text, /Alice likes tea/i);
@@ -38,7 +39,7 @@ test("buildGraphReflectionContext returns undefined when graph disabled or empty
     limitFacts: 10,
     bridge: {
       recall: async () => ({
-        groupId: "global",
+        groupIds: ["global"],
         nodes: [{ label: "X" }],
         facts: [{ text: "X likes Y" }],
       }),
@@ -54,7 +55,7 @@ test("buildGraphReflectionContext returns undefined when graph disabled or empty
     limitFacts: 10,
     bridge: {
       recall: async () => ({
-        groupId: "global",
+        groupIds: ["global"],
         nodes: [],
         facts: [],
       }),
