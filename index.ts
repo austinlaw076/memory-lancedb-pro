@@ -24,7 +24,7 @@ import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "
 import type { MdMirrorWriter } from "./src/tools.js";
 import { AccessTracker } from "./src/access-tracker.js";
 import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
-import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
+import { resolveReflectionSessionSearchDirs } from "./src/session-recovery.js";
 import {
   storeReflectionToLanceDB,
   loadAgentReflectionSlicesFromEntries,
@@ -47,13 +47,22 @@ import { createGraphInferenceJob } from "./src/graphiti/inference.js";
 import { buildGraphReflectionContext } from "./src/graphiti/reflection.js";
 import { createWorkspaceDocsMaterializer } from "./src/workspace-docs.js";
 import type { GraphitiPluginConfig } from "./src/graphiti/types.js";
-import { extractReflectionOpenLoops } from "./src/reflection-slices.js";
 import {
   loadAgentDerivedRowsWithScoresFromEntries,
-  loadAgentReflectionSlicesFromEntries,
 } from "./src/reflection-store.js";
 import { rankDynamicReflectionRecallFromEntries } from "./src/reflection-recall.js";
-import { resolveReflectionSessionSearchDirs } from "./src/session-recovery.js";
+import {
+  clearDynamicRecallSessionState,
+  createDynamicRecallSessionState,
+  filterByMaxAge,
+  keepMostRecentPerNormalizedKey,
+  normalizeRecallTextKey,
+  orchestrateDynamicRecall,
+} from "./src/recall-engine.js";
+import { rankDynamicReflectionRecallFromEntries } from "./src/reflection-recall.js";
+import { selectFinalAutoRecallResults } from "./src/auto-recall-final-selection.js";
+import { createGraphitiBridge } from "./src/graphiti/bridge.js";
+import type { GraphitiPluginConfig } from "./src/graphiti/types.js";
 
 // ============================================================================
 // Configuration & Types
@@ -62,7 +71,7 @@ import { resolveReflectionSessionSearchDirs } from "./src/session-recovery.js";
 interface PluginConfig {
   embedding: {
     provider: "openai-compatible";
-    apiKey: string;
+    apiKey?: string;
     model?: string;
     baseURL?: string;
     dimensions?: number;
@@ -80,6 +89,7 @@ interface PluginConfig {
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
   autoRecallTopK?: number;
+  autoRecallSelectionMode?: AutoRecallSelectionMode;
   autoRecallCategories?: MemoryCategory[];
   autoRecallExcludeReflection?: boolean;
   autoRecallMaxAgeDays?: number;
@@ -157,8 +167,30 @@ interface ReflectionRecallConfig {
 const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
 const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
 const DEFAULT_REFLECTION_RECALL_TOP_K = 6;
+const DEFAULT_REFLECTION_MAX_INPUT_CHARS = 24_000;
+const DEFAULT_REFLECTION_TIMEOUT_MS = 20_000;
+const DEFAULT_REFLECTION_THINK_LEVEL = "medium";
+const DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES = 3;
+const DEFAULT_REFLECTION_RECALL_MODE = "fixed";
+const DEFAULT_REFLECTION_RECALL_INCLUDE_KINDS: ReflectionRecallKind[] = ["invariant"];
+const DEFAULT_REFLECTION_RECALL_MAX_AGE_DAYS = 45;
+const DEFAULT_REFLECTION_RECALL_MAX_ENTRIES_PER_KEY = 10;
+const DEFAULT_REFLECTION_RECALL_MIN_REPEATED = 2;
+const DEFAULT_REFLECTION_RECALL_MIN_SCORE = 0.18;
+const DEFAULT_REFLECTION_RECALL_MIN_PROMPT_LENGTH = 8;
+const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 4_000;
+const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
+const DEFAULT_REFLECTION_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const COMMAND_HOOK_EVENT_MARKER_PREFIX = "memory-lancedb-pro.command-hook.";
 const DEFAULT_AUTO_RECALL_TOP_K = 3;
+const DEFAULT_AUTO_RECALL_MAX_AGE_DAYS = 30;
+const DEFAULT_AUTO_RECALL_MAX_ENTRIES_PER_KEY = 10;
 const DEFAULT_AUTO_RECALL_CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
+const DIAG_BUILD_TAG = "local-hotfix-20260309";
+=======
+type AutoRecallSelectionMode = "mmr" | "setwise-v2";
+type MemoryCategory = "preference" | "fact" | "decision" | "entity" | "other" | "reflection";
+>>>>>>> upstream/main
 
 // ============================================================================
 // Default Configuration
@@ -205,6 +237,192 @@ function parsePositiveInt(value: unknown): number | undefined {
 
 function isLocalEmbeddingBaseUrl(raw: string | undefined): boolean {
   if (!raw || raw.trim().length === 0) return false;
+  try {
+    const url = new URL(raw);
+    return url.hostname === "localhost" || url.hostname === "127.0.0.1";
+  } catch {
+    return false;
+  }
+}
+
+function parseNonNegativeNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return undefined;
+    const resolved = resolveEnvVars(s);
+    const n = Number(resolved);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return undefined;
+}
+
+function parseMemoryCategories(value: unknown, fallback: MemoryCategory[]): MemoryCategory[] {
+  if (!Array.isArray(value)) return [...fallback];
+  const parsed = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item): item is MemoryCategory =>
+      item === "preference" ||
+      item === "fact" ||
+      item === "decision" ||
+      item === "entity" ||
+      item === "other" ||
+      item === "reflection"
+    );
+  return parsed.length > 0 ? [...new Set(parsed)] : [...fallback];
+}
+
+function parseReflectionRecallKinds(value: unknown, fallback: ReflectionRecallKind[]): ReflectionRecallKind[] {
+  if (!Array.isArray(value)) return [...fallback];
+  const parsed = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item): item is ReflectionRecallKind => item === "invariant" || item === "derived");
+  return parsed.length > 0 ? [...new Set(parsed)] : [...fallback];
+}
+
+function daysToMs(days: number | undefined): number | undefined {
+  if (!Number.isFinite(days) || Number(days) <= 0) return undefined;
+  return Number(days) * 24 * 60 * 60 * 1000;
+}
+
+const DEFAULT_SELF_IMPROVEMENT_REMINDER = `## Self-Improvement Reminder
+
+After completing tasks, evaluate if any learnings should be captured:
+
+**Log when:**
+- User corrects you -> .learnings/LEARNINGS.md
+- Command/operation fails -> .learnings/ERRORS.md
+- You discover your knowledge was wrong -> .learnings/LEARNINGS.md
+- You find a better approach -> .learnings/LEARNINGS.md
+
+**Promote when pattern is proven:**
+- Behavioral patterns -> SOUL.md
+- Workflow improvements -> AGENTS.md
+- Tool gotchas -> TOOLS.md
+
+Keep entries simple: date, title, what happened, what to do differently.`;
+
+const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
+const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
+const DEFAULT_REFLECTION_MAX_INPUT_CHARS = 24_000;
+const DEFAULT_REFLECTION_TIMEOUT_MS = 20_000;
+const DEFAULT_REFLECTION_THINK_LEVEL: ReflectionThinkLevel = "medium";
+const DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES = 3;
+const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
+const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
+const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
+const DEFAULT_AUTO_RECALL_TOP_K = 3;
+const DEFAULT_AUTO_RECALL_SELECTION_MODE: AutoRecallSelectionMode = "mmr";
+const DEFAULT_AUTO_RECALL_EXCLUDE_REFLECTION = true;
+const DEFAULT_AUTO_RECALL_MAX_AGE_DAYS = 30;
+const DEFAULT_AUTO_RECALL_MAX_ENTRIES_PER_KEY = 10;
+const DEFAULT_AUTO_RECALL_CATEGORIES: MemoryCategory[] = ["preference", "fact", "decision", "entity", "other"];
+const DEFAULT_REFLECTION_RECALL_MODE: ReflectionRecallMode = "fixed";
+const DEFAULT_REFLECTION_RECALL_TOP_K = 6;
+const DEFAULT_REFLECTION_RECALL_INCLUDE_KINDS: ReflectionRecallKind[] = ["invariant"];
+const DEFAULT_REFLECTION_RECALL_MAX_AGE_DAYS = 45;
+const DEFAULT_REFLECTION_RECALL_MAX_ENTRIES_PER_KEY = 10;
+const DEFAULT_REFLECTION_RECALL_MIN_REPEATED = 2;
+const DEFAULT_REFLECTION_RECALL_MIN_SCORE = 0.18;
+const DEFAULT_REFLECTION_RECALL_MIN_PROMPT_LENGTH = 8;
+// Rendering safety guard only; ranking/store layer owns the semantic final-13 cap.
+const DERIVED_FOCUS_RENDER_HARD_LIMIT = 64;
+const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
+const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
+
+function buildReflectionDerivedFocusBlock(derivedLines: string[]): string {
+  const trimmed = derivedLines
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, DERIVED_FOCUS_RENDER_HARD_LIMIT);
+  if (trimmed.length === 0) return "";
+  return [
+    "<derived-focus>",
+    "Weighted recent derived execution deltas from reflection memory:",
+    ...trimmed.map((line, i) => `${i + 1}. ${line}`),
+    "</derived-focus>",
+  ].join("\n");
+}
+
+function buildReflectionOpenLoopsBlock(openLoopLines: string[]): string {
+  const trimmed = openLoopLines
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, 6);
+  if (trimmed.length === 0) return "";
+  return [
+    "<open-loops>",
+    "Fresh open loops / next actions from this reflection run:",
+    ...trimmed.map((line, i) => `${i + 1}. ${line}`),
+    "</open-loops>",
+  ].join("\n");
+}
+
+function buildSelfImprovementResetNote(params?: { openLoopsBlock?: string; derivedFocusBlock?: string }): string {
+  const openLoopsBlock = typeof params?.openLoopsBlock === "string" ? params.openLoopsBlock : "";
+  const derivedFocusBlock = typeof params?.derivedFocusBlock === "string" ? params.derivedFocusBlock : "";
+  const base = [
+    SELF_IMPROVEMENT_NOTE_PREFIX,
+    "- If anything was learned/corrected, log it now:",
+    "  - .learnings/LEARNINGS.md (corrections/best practices)",
+    "  - .learnings/ERRORS.md (failures/root causes)",
+    "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
+    "- If reusable across tasks, extract a new skill from the learning.",
+  ];
+  if (openLoopsBlock) {
+    base.push("- Fresh run handoff:");
+    base.push(openLoopsBlock);
+  }
+  if (derivedFocusBlock) {
+    base.push("- Historical reflection-derived focus:");
+    base.push(derivedFocusBlock);
+  }
+  base.push("- Then proceed with the new session.");
+  return base.join("\n");
+}
+
+type ReflectionErrorSignal = {
+  at: number;
+  toolName: string;
+  summary: string;
+  source: "tool_error" | "tool_output";
+  signature: string;
+  signatureHash: string;
+};
+
+type ReflectionErrorState = {
+  entries: ReflectionErrorSignal[];
+  lastInjectedCount: number;
+  signatureSet: Set<string>;
+  updatedAt: number;
+};
+
+type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
+
+const requireFromHere = createRequire(import.meta.url);
+let embeddedPiRunnerPromise: Promise<EmbeddedPiRunner> | null = null;
+
+function toImportSpecifier(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("file://")) return trimmed;
+  if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
+  return trimmed;
+}
+
+function getExtensionApiImportSpecifiers(): string[] {
+  const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
+  const specifiers: string[] = [];
+
+  if (envPath) specifiers.push(toImportSpecifier(envPath));
+  specifiers.push("openclaw/dist/extensionAPI.js");
+
+>>>>>>> upstream/main
   try {
     const parsed = new URL(raw.trim());
     const host = parsed.hostname.toLowerCase();
@@ -476,7 +694,7 @@ async function findPreviousSessionFile(
       );
       if (nonReset.length > 0) return join(sessionsDir, nonReset[0]);
     }
-  } catch {}
+  } catch { }
 }
 
 function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
@@ -583,16 +801,26 @@ type AgentWorkspaceMap = Record<string, string>;
 function resolveAgentWorkspaceMap(api: OpenClawPluginApi): AgentWorkspaceMap {
   const map: AgentWorkspaceMap = {};
 
-  // Try api.config first (runtime config)
-  const agents = Array.isArray((api as any).config?.agents?.list)
-    ? (api as any).config.agents.list
-    : [];
+  const assignFromConfigRoot = (root: any) => {
+    const defaultWorkspace = typeof root?.agents?.defaults?.workspace === "string"
+      ? root.agents.defaults.workspace
+      : undefined;
+    const agents = Array.isArray(root?.agents?.list)
+      ? root.agents.list
+      : [];
 
-  for (const agent of agents) {
-    if (agent?.id && typeof agent.workspace === "string") {
-      map[String(agent.id)] = agent.workspace;
+    for (const agent of agents) {
+      if (!agent?.id) continue;
+      const explicitWorkspace = typeof agent.workspace === "string" ? agent.workspace : undefined;
+      const resolvedWorkspace = explicitWorkspace || defaultWorkspace;
+      if (resolvedWorkspace) {
+        map[String(agent.id)] = resolvedWorkspace;
+      }
     }
-  }
+  };
+
+  // Try api.config first (runtime config)
+  assignFromConfigRoot((api as any).config || {});
 
   // Fallback: read from openclaw.json (respect OPENCLAW_HOME if set)
   if (Object.keys(map).length === 0) {
@@ -601,14 +829,7 @@ function resolveAgentWorkspaceMap(api: OpenClawPluginApi): AgentWorkspaceMap {
       const configPath = join(openclawHome, "openclaw.json");
       const raw = readFileSync(configPath, "utf8");
       const parsed = JSON.parse(raw);
-      const list = parsed?.agents?.list;
-      if (Array.isArray(list)) {
-        for (const agent of list) {
-          if (agent?.id && typeof agent.workspace === "string") {
-            map[String(agent.id)] = agent.workspace;
-          }
-        }
-      }
+      assignFromConfigRoot(parsed || {});
     } catch {
       /* silent */
     }
@@ -702,7 +923,7 @@ const memoryLanceDBProPlugin = {
     } catch (err) {
       api.logger.warn(
         `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-          `  The plugin will still attempt to start, but writes may fail.`,
+        `  The plugin will still attempt to start, but writes may fail.`,
       );
     }
 
@@ -751,6 +972,7 @@ const memoryLanceDBProPlugin = {
       store,
       logger: api.logger,
     });
+    const agentWorkspaceMap = resolveAgentWorkspaceMap(api);
 
     const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
     const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
@@ -974,19 +1196,40 @@ const memoryLanceDBProPlugin = {
     // Default is OFF to prevent the model from accidentally echoing injected context.
     if (config.autoRecall === true) {
       api.on("before_agent_start", async (event, ctx) => {
+
         try {
           const agentId = ctx?.agentId || "main";
           const sessionId = ctx?.sessionId || "default";
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
-          const topK = Number.isFinite(config.autoRecallTopK)
-            ? Math.max(1, Math.floor(Number(config.autoRecallTopK)))
-            : DEFAULT_AUTO_RECALL_TOP_K;
-
-          const results = await retriever.retrieve({
-            query: event.prompt,
-            limit: topK * 2,
-            scopeFilter: accessibleScopes,
-            source: "auto-recall",
+          const topK = config.autoRecallTopK ?? DEFAULT_AUTO_RECALL_TOP_K;
+          const fetchLimit = Math.min(20, Math.max(topK * 4, topK, 8));
+          return await orchestrateDynamicRecall({
+            channelName: "auto-recall",
+            prompt: event.prompt,
+            minPromptLength: config.autoRecallMinLength,
+            minRepeated: config.autoRecallMinRepeated,
+            topK,
+            sessionId,
+            state: autoRecallState,
+            outputTag: "relevant-memories",
+            headerLines: [],
+            wrapUntrustedData: true,
+            logger: api.logger,
+            loadCandidates: async () => {
+              const retrieved = await retriever.retrieve({
+                query: event.prompt,
+                limit: fetchLimit,
+                scopeFilter: accessibleScopes,
+                source: "auto-recall",
+              });
+              const postProcessed = postProcessAutoRecallResults(retrieved);
+              if (config.autoRecallSelectionMode === "setwise-v2") {
+                return selectFinalAutoRecallResults(postProcessed, { topK });
+              }
+              return postProcessed.slice(0, topK);
+            },
+            formatLine: (row) =>
+              `- [${row.entry.category}:${row.entry.scope}] ${sanitizeForContext(row.entry.text)} (${(row.score * 100).toFixed(0)}%${row.sources?.bm25 ? ", vector+BM25" : ""}${row.sources?.reranked ? "+reranked" : ""})`,
           });
 
           const allowedCategories = new Set(config.autoRecallCategories || DEFAULT_AUTO_RECALL_CATEGORIES);
@@ -1193,211 +1436,8 @@ const memoryLanceDBProPlugin = {
     }
 
     // ========================================================================
-    // Memory Reflection Hooks (sessionStrategy=memoryReflection)
+    // Durable Command Hook Helpers
     // ========================================================================
-
-    if (config.sessionStrategy === "memoryReflection") {
-      const reflectionRecall = config.memoryReflection.recall;
-
-      const loadReflectionEntries = async (agentId: string): Promise<MemoryEntry[]> => {
-        const scopes = scopeManager.getAccessibleScopes(agentId);
-        return await store.list(scopes, "reflection", 400, 0);
-      };
-
-      api.on("after_tool_call", (event, ctx) => {
-        const sessionKey = asNonEmptyString(ctx?.sessionKey);
-        if (!sessionKey) return;
-
-        if (typeof event?.error === "string" && event.error.trim().length > 0) {
-          pushReflectionErrorSignal(sessionKey, {
-            at: Date.now(),
-            toolName: asNonEmptyString(event.toolName) || "unknown",
-            summary: event.error.trim(),
-          });
-          return;
-        }
-
-        const resultText = extractTextFromToolResult(event?.result);
-        if (resultText && looksLikeErrorText(resultText)) {
-          pushReflectionErrorSignal(sessionKey, {
-            at: Date.now(),
-            toolName: asNonEmptyString(event?.toolName) || "unknown",
-            summary: resultText.replace(/\s+/g, " ").trim().slice(0, 220),
-          });
-        }
-      }, { priority: 15 });
-
-      api.on("before_agent_start", async (_event, ctx) => {
-        try {
-          const agentId = asNonEmptyString(ctx?.agentId) || "main";
-          const entries = await loadReflectionEntries(agentId);
-
-          let lines: string[] = [];
-          if (reflectionRecall.mode === "dynamic") {
-            const rows = rankDynamicReflectionRecallFromEntries(entries, {
-              agentId,
-              includeKinds: reflectionRecall.includeKinds,
-              topK: reflectionRecall.topK,
-              maxAgeMs: Number.isFinite(reflectionRecall.maxAgeDays)
-                ? Math.max(1, Number(reflectionRecall.maxAgeDays)) * 24 * 60 * 60 * 1000
-                : undefined,
-              maxEntriesPerKey: reflectionRecall.maxEntriesPerKey,
-              minScore: reflectionRecall.minScore,
-            });
-            lines = rows.map((row) => row.text);
-          } else {
-            const slices = loadAgentReflectionSlicesFromEntries({
-              entries,
-              agentId,
-            });
-            lines = slices.invariants;
-          }
-
-          const topK = Number.isFinite(reflectionRecall.topK)
-            ? Math.max(1, Math.floor(Number(reflectionRecall.topK)))
-            : DEFAULT_REFLECTION_RECALL_TOP_K;
-          const selected = lines.slice(0, topK);
-          if (selected.length === 0) return;
-
-          return {
-            prependContext: [
-              "<inherited-rules>",
-              "Stable rules inherited from memory-lancedb-pro reflections. Treat as long-term behavioral constraints unless user overrides.",
-              ...selected.map((line, i) => `${i + 1}. ${line}`),
-              "</inherited-rules>",
-            ].join("\n"),
-          };
-        } catch (err) {
-          api.logger.warn(`memory-reflection: inheritance injection failed: ${String(err)}`);
-        }
-      }, { priority: 12 });
-
-      api.on("before_prompt_build", async (_event, ctx) => {
-        const sessionKey = asNonEmptyString(ctx?.sessionKey);
-        const blocks: string[] = [];
-        const pending = sessionKey ? getReflectionErrorReminders(sessionKey, 3) : [];
-
-        if (pending.length === 0 && config.memoryReflection.injectMode === "inheritance+derived" && sessionKey) {
-          const derived = reflectionDerivedBySession.get(sessionKey)?.derived ?? [];
-          if (derived.length > 0) {
-            blocks.push([
-              "<derived-focus>",
-              "Latest derived execution deltas from reflection memory:",
-              ...derived.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
-              "</derived-focus>",
-            ].join("\n"));
-          }
-        }
-
-        if (pending.length > 0) {
-          blocks.push([
-            "<error-detected>",
-            "A tool error was detected. Consider logging this to `.learnings/ERRORS.md` if it is non-trivial or likely to recur.",
-            "Recent error signals:",
-            ...pending.map((signal, i) => `${i + 1}. [${signal.toolName}] ${signal.summary}`),
-            "</error-detected>",
-          ].join("\n"));
-        }
-
-        if (blocks.length === 0) return;
-        return { prependContext: blocks.join("\n\n") };
-      }, { priority: 15 });
-
-      api.on("session_end", (_event, ctx) => {
-        const sessionKey = asNonEmptyString(ctx?.sessionKey);
-        if (!sessionKey) return;
-        reflectionErrorSignalsBySession.delete(sessionKey);
-        reflectionDerivedBySession.delete(sessionKey);
-      }, { priority: 20 });
-
-      api.registerHook("command:new", async (event) => {
-        try {
-          if (!Array.isArray(event.messages)) return;
-          if (event.messages.some((item: unknown) => typeof item === "string" && item.includes(SELF_IMPROVEMENT_NOTE_PREFIX))) {
-            return;
-          }
-
-          const context = (event.context || {}) as Record<string, unknown>;
-          const cfg = (context.cfg || {}) as Record<string, unknown>;
-          const sourceAgentId = parseAgentIdFromSessionKey(asNonEmptyString(event.sessionKey)) || "main";
-          const workspaceDir = asNonEmptyString(context.workspaceDir) || join(homedir(), ".openclaw", "workspace");
-
-          const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
-          const currentSessionId = asNonEmptyString(sessionEntry.sessionId) || "unknown";
-          let currentSessionFile = asNonEmptyString(sessionEntry.sessionFile);
-
-          if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
-            const searchDirs = resolveReflectionSessionSearchDirs({
-              context,
-              cfg,
-              workspaceDir,
-              currentSessionFile,
-              sourceAgentId,
-            });
-
-            for (const sessionsDir of searchDirs) {
-              const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
-              if (recovered) {
-                currentSessionFile = recovered;
-                break;
-              }
-            }
-          }
-
-          if (!currentSessionFile) return;
-
-          const conversation = await readSessionConversationWithResetFallback(
-            currentSessionFile,
-            config.memoryReflection.messageCount
-          );
-          if (!conversation) return;
-
-          const reflectionText = (await loadEmbeddedReflectionText()) || "";
-          const openLoops = reflectionText ? extractReflectionOpenLoops(reflectionText) : [];
-          const entries = await loadReflectionEntries(sourceAgentId);
-          const derivedFocus = loadAgentDerivedRowsWithScoresFromEntries({
-            entries,
-            agentId: sourceAgentId,
-          })
-            .map((row) => row.text)
-            .slice(0, 6);
-
-          const sessionKey = asNonEmptyString(event.sessionKey);
-          if (sessionKey) {
-            reflectionDerivedBySession.set(sessionKey, {
-              updatedAt: Date.now(),
-              derived: derivedFocus,
-            });
-          }
-
-          if (config.selfImprovement?.enabled === false || config.selfImprovement?.beforeResetNote === false) return;
-          event.messages.push(
-            buildSelfImprovementNote({
-              openLoops,
-              derivedFocus,
-            })
-          );
-        } catch (err) {
-          api.logger.warn(`memory-reflection: command:new hook failed: ${String(err)}`);
-        }
-      }, {
-        name: "memory-lancedb-pro.memory-reflection.command-new",
-        description: "Generate reflection handoff note before /new",
-      });
-
-      api.logger.info("memory-reflection: integrated hooks registered (command:new, after_tool_call, before_agent_start, before_prompt_build)");
-    }
-
-    // ========================================================================
-    // Session Memory Hook (replaces built-in session-memory)
-    // ========================================================================
-
-    if (config.sessionStrategy === "systemSessionMemory" && config.sessionMemory?.enabled === true) {
-      // DISABLED by default (2026-07-09): session summaries stored in LanceDB pollute
-      // retrieval quality. OpenClaw already saves .jsonl files to ~/.openclaw/agents/*/sessions/
-      // and memorySearch.sources: ["memory", "sessions"] can search them directly.
-      // Set sessionMemory.enabled: true in plugin config to re-enable.
-      const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
 
     const registerDurableCommandHook = (
       eventName: "command:new" | "command:reset",
@@ -1650,82 +1690,90 @@ const memoryLanceDBProPlugin = {
         }
       }, { priority: 15 });
 
-      api.on("before_agent_start", async (event, ctx) => {
-        const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
-        if (isInternalReflectionSessionKey(sessionKey)) return;
-        if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
-        try {
-          pruneReflectionSessionState();
-          const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
-          const scopes = scopeManager.getAccessibleScopes(agentId);
-          if (reflectionRecallMode === "fixed") {
-            const slices = await loadAgentReflectionSlices(agentId, scopes);
-            if (slices.invariants.length === 0) return;
-            const body = slices.invariants.slice(0, 6).map((line, i) => `${i + 1}. ${line}`).join("\n");
-            return {
-              prependContext: [
-                "<inherited-rules>",
-                "Stable rules inherited from memory-lancedb-pro reflections. Treat as long-term behavioral constraints unless user overrides.",
-                body,
-                "</inherited-rules>",
-              ].join("\n"),
-            };
-          }
-
-          const sessionId = ctx?.sessionId || "default";
-          const topK = Math.max(1, reflectionRecallTopK);
-          const listLimit = Math.min(800, Math.max(topK * 40, 240));
-          const result = await orchestrateDynamicRecall({
-            channelName: "reflection-recall",
-            prompt: event.prompt,
-            minPromptLength: reflectionRecallMinPromptLength,
-            minRepeated: reflectionRecallMinRepeated,
-            topK,
-            sessionId,
-            state: reflectionDynamicRecallState,
-            outputTag: "inherited-rules",
-            headerLines: [
-              "Dynamic rules selected by Reflection-Recall. Treat as long-term behavioral constraints unless user overrides.",
-            ],
-            logger: api.logger,
-            loadCandidates: async () => {
-              const entries = await store.list(scopes, "reflection", listLimit, 0);
-              return rankDynamicReflectionRecallFromEntries(entries, {
-                agentId,
-                includeKinds: reflectionRecallIncludeKinds,
-                topK,
-                maxAgeMs: daysToMs(reflectionRecallMaxAgeDays),
-                maxEntriesPerKey: reflectionRecallMaxEntriesPerKey,
-                minScore: reflectionRecallMinScore,
-              });
-            },
-            formatLine: (row, index) =>
-              `${index + 1}. ${sanitizeForContext(row.text)} (${(row.score * 100).toFixed(0)}%)`,
-          });
-          if (!result) return;
-          return { prependContext: result.prependContext };
-        } catch (err) {
-          api.logger.warn(`memory-reflection: reflection-recall injection failed: ${String(err)}`);
+      const buildReflectionRecallPrependContext = async (
+        event: { prompt?: string } | undefined,
+        ctx: { sessionId?: string; sessionKey?: string; agentId?: string },
+      ): Promise<string | undefined> => {
+        const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
+        const scopes = scopeManager.getAccessibleScopes(agentId);
+        if (reflectionRecallMode === "fixed") {
+          const slices = await loadAgentReflectionSlices(agentId, scopes);
+          if (slices.invariants.length === 0) return undefined;
+          const body = slices.invariants.slice(0, 6).map((line, i) => `${i + 1}. ${line}`).join("\n");
+          return [
+            "<inherited-rules>",
+            "Stable rules inherited from memory-lancedb-pro reflections. Treat as long-term behavioral constraints unless user overrides.",
+            body,
+            "</inherited-rules>",
+          ].join("\n");
         }
-      }, { priority: 12 });
 
-      api.on("before_prompt_build", async (_event, ctx) => {
+        const sessionId = ctx?.sessionId || ctx?.sessionKey || "default";
+        const topK = Math.max(1, reflectionRecallTopK);
+        const listLimit = Math.min(800, Math.max(topK * 40, 240));
+        const result = await orchestrateDynamicRecall({
+          channelName: "reflection-recall",
+          prompt: event?.prompt,
+          minPromptLength: reflectionRecallMinPromptLength,
+          minRepeated: reflectionRecallMinRepeated,
+          topK,
+          sessionId,
+          state: reflectionDynamicRecallState,
+          outputTag: "inherited-rules",
+          headerLines: [
+            "Dynamic rules selected by Reflection-Recall. Treat as long-term behavioral constraints unless user overrides.",
+          ],
+          logger: api.logger,
+          loadCandidates: async () => {
+            const entries = await store.list(scopes, "reflection", listLimit, 0);
+            return rankDynamicReflectionRecallFromEntries(entries, {
+              agentId,
+              includeKinds: reflectionRecallIncludeKinds,
+              topK,
+              maxAgeMs: daysToMs(reflectionRecallMaxAgeDays),
+              maxEntriesPerKey: reflectionRecallMaxEntriesPerKey,
+              minScore: reflectionRecallMinScore,
+            });
+          },
+          formatLine: (row, index) =>
+            `${index + 1}. ${sanitizeForContext(row.text)} (${(row.score * 100).toFixed(0)}%)`,
+        });
+        return result?.prependContext;
+      };
+
+      api.on("before_prompt_build", async (event, ctx) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
         pruneReflectionSessionState();
 
-        if (!sessionKey) return;
-        const pending = getPendingReflectionErrorSignalsForPrompt(sessionKey, reflectionErrorReminderMaxEntries);
-        if (pending.length === 0) return;
-        return {
-          prependContext: [
-            "<error-detected>",
-            "A tool error was detected. Consider logging this to `.learnings/ERRORS.md` if it is non-trivial or likely to recur.",
-            "Recent error signals:",
-            ...pending.map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary}`),
-            "</error-detected>",
-          ].join("\n"),
-        };
+        const contextBlocks: string[] = [];
+
+        if (reflectionInjectMode === "inheritance-only" || reflectionInjectMode === "inheritance+derived") {
+          try {
+            const inheritedRules = await buildReflectionRecallPrependContext(event, ctx);
+            if (inheritedRules) {
+              contextBlocks.push(inheritedRules);
+            }
+          } catch (err) {
+            api.logger.warn(`memory-reflection: reflection-recall injection failed: ${String(err)}`);
+          }
+        }
+
+        if (sessionKey) {
+          const pending = getPendingReflectionErrorSignalsForPrompt(sessionKey, reflectionErrorReminderMaxEntries);
+          if (pending.length > 0) {
+            contextBlocks.push([
+              "<error-detected>",
+              "A tool error was detected. Consider logging this to `.learnings/ERRORS.md` if it is non-trivial or likely to recur.",
+              "Recent error signals:",
+              ...pending.map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary}`),
+              "</error-detected>",
+            ].join("\n"));
+          }
+        }
+
+        if (contextBlocks.length === 0) return;
+        return { prependContext: contextBlocks.join("\n\n") };
       }, { priority: 15 });
 
       api.on("session_end", (_event, ctx) => {
@@ -1752,6 +1800,9 @@ const memoryLanceDBProPlugin = {
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+          const sourceWorkspaceDir = agentWorkspaceMap[sourceAgentId] || workspaceDir;
+          const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
+          const reflectionWorkspaceDir = agentWorkspaceMap[reflectionRunAgentId] || sourceWorkspaceDir;
           const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
           const triggerKey = `${String(event?.action || "unknown")}|${sessionKey || "(none)"}|${currentSessionFile || currentSessionId || "unknown"}`;
           if (isDuplicateReflectionTrigger(triggerKey)) {
@@ -1768,7 +1819,7 @@ const memoryLanceDBProPlugin = {
             const searchDirs = resolveReflectionSessionSearchDirs({
               context,
               cfg,
-              workspaceDir,
+              workspaceDir: sourceWorkspaceDir,
               currentSessionFile,
               sourceAgentId,
             });
@@ -1791,7 +1842,7 @@ const memoryLanceDBProPlugin = {
             const searchDirs = resolveReflectionSessionSearchDirs({
               context,
               cfg,
-              workspaceDir,
+              workspaceDir: sourceWorkspaceDir,
               currentSessionFile,
               sourceAgentId,
             });
@@ -1815,7 +1866,6 @@ const memoryLanceDBProPlugin = {
           const timeIso = now.toISOString().split("T")[1].replace("Z", "");
           const timeHms = timeIso.split(".")[0];
           const timeCompact = timeIso.replace(/[:.]/g, "");
-          const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
           const targetScope = scopeManager.getDefaultScope(sourceAgentId);
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
@@ -1841,7 +1891,7 @@ const memoryLanceDBProPlugin = {
             maxInputChars: reflectionMaxInputChars,
             cfg,
             agentId: reflectionRunAgentId,
-            workspaceDir,
+            workspaceDir: reflectionWorkspaceDir,
             timeoutMs: reflectionTimeoutMs,
             thinkLevel: reflectionThinkLevel,
             toolErrorSignals,
@@ -1913,7 +1963,7 @@ const memoryLanceDBProPlugin = {
             : "\n";
           const reflectionBody = `${header}${reflectionText.trim()}${graphSnapshotSuffix}`;
 
-          const outDir = join(workspaceDir, "memory", "reflections", dateStr);
+          const outDir = join(sourceWorkspaceDir, "memory", "reflections", dateStr);
           await mkdir(outDir, { recursive: true });
           const agentToken = sanitizeFileToken(sourceAgentId, "agent");
           const sessionToken = sanitizeFileToken(currentSessionId || "unknown", "session");
@@ -1923,7 +1973,7 @@ const memoryLanceDBProPlugin = {
             const suffix = attempt === 0 ? "" : `-${Math.random().toString(36).slice(2, 8)}`;
             const fileName = `${timeCompact}-${agentToken}-${sessionToken}${suffix}.md`;
             const candidateRelPath = join("memory", "reflections", dateStr, fileName);
-            const candidateOutPath = join(workspaceDir, candidateRelPath);
+            const candidateOutPath = join(sourceWorkspaceDir, candidateRelPath);
             try {
               await writeFile(candidateOutPath, reflectionBody, { encoding: "utf-8", flag: "wx" });
               relPath = candidateRelPath;
@@ -1942,7 +1992,7 @@ const memoryLanceDBProPlugin = {
           if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
             for (const candidate of reflectionGovernanceCandidates) {
               await appendSelfImprovementEntry({
-                baseDir: workspaceDir,
+                baseDir: sourceWorkspaceDir,
                 type: "learning",
                 summary: candidate.summary,
                 details: candidate.details,
@@ -2129,7 +2179,7 @@ const memoryLanceDBProPlugin = {
             }
           }
 
-          const dailyPath = join(workspaceDir, "memory", `${dateStr}.md`);
+          const dailyPath = join(sourceWorkspaceDir, "memory", `${dateStr}.md`);
           await ensureDailyLogFile(dailyPath, dateStr);
           await appendFile(dailyPath, `- [${timeHms} UTC] Reflection generated: \`${relPath}\`\n`, "utf-8");
 
@@ -2188,7 +2238,7 @@ const memoryLanceDBProPlugin = {
           api.logger.warn(`memory-reflection: before_reset fallback failed: ${String(err)}`);
         }
       }, { priority: 12 });
-      api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_agent_start, before_prompt_build)");
+      api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build[inherited-rules,error-detected])");
     }
 
     if (config.sessionStrategy === "systemSessionMemory") {
@@ -2241,7 +2291,7 @@ const memoryLanceDBProPlugin = {
         if (files.length > 7) {
           const { unlink } = await import("node:fs/promises");
           for (const old of files.slice(0, files.length - 7)) {
-            await unlink(join(backupDir, old)).catch(() => {});
+            await unlink(join(backupDir, old)).catch(() => { });
           }
         }
 
@@ -2264,11 +2314,11 @@ const memoryLanceDBProPlugin = {
         // If embedding/retrieval tests hang (bad network / slow provider), the gateway
         // may never bind its HTTP port, causing restart timeouts.
 
-        const withTimeout = async <T>(
+        async function withTimeout<T>(
           p: Promise<T>,
           ms: number,
           label: string,
-        ): Promise<T> => {
+        ): Promise<T> {
           let timeout: ReturnType<typeof setTimeout> | undefined;
           const timeoutPromise = new Promise<never>((_, reject) => {
             timeout = setTimeout(
@@ -2281,7 +2331,7 @@ const memoryLanceDBProPlugin = {
           } finally {
             if (timeout) clearTimeout(timeout);
           }
-        };
+        }
 
         const runStartupChecks = async () => {
           try {
@@ -2299,10 +2349,10 @@ const memoryLanceDBProPlugin = {
 
             api.logger.info(
               `memory-lancedb-pro: initialized successfully ` +
-                `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
-                `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
-                `mode: ${retrievalTest.mode}, ` +
-                `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
+              `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
+              `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
+              `mode: ${retrievalTest.mode}, ` +
+              `FTS: support=${retrievalTest.hasFtsSupport ? "yes" : "no"}, index=${retrievalTest.hasFtsIndex ? "yes" : "no"})`,
             );
 
             if (!embedTest.success) {
@@ -2496,6 +2546,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     minPromptLength: parsePositiveInt(reflectionRecallRaw.minPromptLength),
   };
 
+  const reflectionMessageCount = parsePositiveInt(memoryReflectionRaw?.messageCount ?? sessionMemoryRaw?.messageCount) ?? DEFAULT_REFLECTION_MESSAGE_COUNT;
   const injectModeRaw = memoryReflectionRaw?.injectMode;
   const injectMode: ReflectionInjectMode =
     injectModeRaw === "inheritance-only" || injectModeRaw === "inheritance+derived"
@@ -2522,7 +2573,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           graphitiRaw.transport === "mcp" || graphitiRaw.transport === "auto"
             ? graphitiRaw.transport
             : "auto",
-        groupIdMode: graphitiRaw.groupIdMode === "fixed" ? "fixed" : "scope",
+        groupIdMode: graphitiRaw.groupIdMode === "routing" ? "routing" : graphitiRaw.groupIdMode === "fixed" ? "fixed" : "scope",
         fixedGroupId:
           typeof graphitiRaw.fixedGroupId === "string" && graphitiRaw.fixedGroupId.trim().length > 0
             ? graphitiRaw.fixedGroupId.trim()
@@ -2614,6 +2665,31 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         : "memory-lancedb-pro",
     refreshOnReflection: parseBoolean(workspaceDocsRaw?.refreshOnReflection, true),
   };
+=======
+  const reflectionStoreToLanceDB =
+    sessionStrategy === "memoryReflection" &&
+    (memoryReflectionRaw?.storeToLanceDB !== false);
+  const memoryReflectionRecallRaw = typeof memoryReflectionRaw?.recall === "object" && memoryReflectionRaw.recall !== null
+    ? memoryReflectionRaw.recall as Record<string, unknown>
+    : null;
+  const reflectionRecallMode: ReflectionRecallMode =
+    memoryReflectionRecallRaw?.mode === "dynamic" ? "dynamic" : DEFAULT_REFLECTION_RECALL_MODE;
+  const reflectionRecallTopK = parsePositiveInt(memoryReflectionRecallRaw?.topK) ?? DEFAULT_REFLECTION_RECALL_TOP_K;
+  const reflectionRecallIncludeKinds = parseReflectionRecallKinds(
+    memoryReflectionRecallRaw?.includeKinds,
+    DEFAULT_REFLECTION_RECALL_INCLUDE_KINDS
+  );
+  const reflectionRecallMaxAgeDays = parsePositiveInt(memoryReflectionRecallRaw?.maxAgeDays) ?? DEFAULT_REFLECTION_RECALL_MAX_AGE_DAYS;
+  const reflectionRecallMaxEntriesPerKey = parsePositiveInt(memoryReflectionRecallRaw?.maxEntriesPerKey) ?? DEFAULT_REFLECTION_RECALL_MAX_ENTRIES_PER_KEY;
+  const reflectionRecallMinRepeated = parsePositiveInt(memoryReflectionRecallRaw?.minRepeated) ?? DEFAULT_REFLECTION_RECALL_MIN_REPEATED;
+  const reflectionRecallMinScore = parseNonNegativeNumber(memoryReflectionRecallRaw?.minScore) ?? DEFAULT_REFLECTION_RECALL_MIN_SCORE;
+  const reflectionRecallMinPromptLength = parsePositiveInt(memoryReflectionRecallRaw?.minPromptLength) ?? DEFAULT_REFLECTION_RECALL_MIN_PROMPT_LENGTH;
+  const autoRecallSelectionMode: AutoRecallSelectionMode =
+    cfg.autoRecallSelectionMode === "setwise-v2"
+      ? "setwise-v2"
+      : cfg.autoRecallSelectionMode === "mmr" || cfg.autoRecallSelectionMode === "legacy"
+        ? "mmr"
+      : DEFAULT_AUTO_RECALL_SELECTION_MODE;
 
   return {
     embedding: {
@@ -2656,6 +2732,8 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallExcludeReflection: parseBoolean(cfg.autoRecallExcludeReflection, true),
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
+    autoRecallTopK: parsePositiveInt(cfg.autoRecallTopK) ?? DEFAULT_AUTO_RECALL_TOP_K,
+    autoRecallSelectionMode,
     autoRecallMaxAgeDays: parsePositiveInt(cfg.autoRecallMaxAgeDays) ?? DEFAULT_AUTO_RECALL_MAX_AGE_DAYS,
     autoRecallMaxEntriesPerKey: parsePositiveInt(cfg.autoRecallMaxEntriesPerKey) ?? DEFAULT_AUTO_RECALL_MAX_ENTRIES_PER_KEY,
     captureAssistant: cfg.captureAssistant === true,
@@ -2694,26 +2772,26 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
         ? {
-            enabled:
-              (cfg.sessionMemory as Record<string, unknown>).enabled !== false,
-            messageCount:
-              typeof (cfg.sessionMemory as Record<string, unknown>)
-                .messageCount === "number"
-                ? ((cfg.sessionMemory as Record<string, unknown>)
-                    .messageCount as number)
-                : undefined,
-          }
+          enabled:
+            (cfg.sessionMemory as Record<string, unknown>).enabled !== false,
+          messageCount:
+            typeof (cfg.sessionMemory as Record<string, unknown>)
+              .messageCount === "number"
+              ? ((cfg.sessionMemory as Record<string, unknown>)
+                .messageCount as number)
+              : undefined,
+        }
         : undefined,
     mdMirror:
       typeof cfg.mdMirror === "object" && cfg.mdMirror !== null
         ? {
-            enabled:
-              (cfg.mdMirror as Record<string, unknown>).enabled === true,
-            dir:
-              typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
-                ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
-                : undefined,
-          }
+          enabled:
+            (cfg.mdMirror as Record<string, unknown>).enabled === true,
+          dir:
+            typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
+              ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
+              : undefined,
+        }
         : undefined,
   };
 }

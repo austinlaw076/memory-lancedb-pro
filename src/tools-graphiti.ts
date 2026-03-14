@@ -93,13 +93,13 @@ export function registerMemoryGraphRecallTool(
                 {
                   type: "text",
                   text:
-                    `Graph recall for scope "${targetScope}" (group_id="${result.groupId}")\n\n` +
+                    `Graph recall for scope "${targetScope}" (group_ids="${result.groupIds.join(",")}")\n\n` +
                     `Nodes:\n${nodeLines}\n\n` +
                     `Facts:\n${factLines}`,
                 },
               ],
               details: {
-                groupId: result.groupId,
+                groupIds: result.groupIds,
                 scope: targetScope,
                 query,
                 nodes: result.nodes,

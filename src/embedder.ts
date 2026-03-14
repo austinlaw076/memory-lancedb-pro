@@ -1,3 +1,4 @@
+import logger from "./logger.js";
 /**
  * Embedding Abstraction Layer
  * OpenAI-compatible API for various embedding providers.
@@ -85,8 +86,9 @@ class EmbeddingCache {
 
 export interface EmbeddingConfig {
   provider: "openai-compatible";
-  /** Single API key or array of keys for round-robin rotation with failover. */
-  apiKey: string | string[];
+  /** Single API key or array of keys for round-robin rotation with failover.
+   *  Optional for local providers like Ollama that do not require authentication. */
+  apiKey?: string | string[];
   model: string;
   baseURL?: string;
   dimensions?: number;
@@ -295,8 +297,10 @@ export class Embedder {
   private readonly _autoChunk: boolean;
 
   constructor(config: EmbeddingConfig & { chunking?: boolean }) {
-    // Normalize apiKey to array and resolve environment variables
-    const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
+    // Normalize apiKey to array and resolve environment variables.
+    // Fall back to a dummy key for local providers (e.g. Ollama) that don't require auth.
+    const rawKey = config.apiKey ?? "no-key-required";
+    const apiKeys = Array.isArray(rawKey) ? rawKey : [rawKey];
     const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
 
     this._model = config.model;
@@ -315,7 +319,7 @@ export class Embedder {
     }));
 
     if (this.clients.length > 1) {
-      console.log(`[memory-lancedb-pro] Initialized ${this.clients.length} API keys for round-robin rotation`);
+      logger.info(`[memory-lancedb-pro] Initialized ${this.clients.length} API keys for round-robin rotation`);
     }
 
     this.dimensions = getVectorDimensions(config.model, config.dimensions);
@@ -373,7 +377,7 @@ export class Embedder {
         lastError = error instanceof Error ? error : new Error(String(error));
 
         if (this.isRateLimitError(error) && attempt < maxAttempts - 1) {
-          console.log(
+          logger.info(
             `[memory-lancedb-pro] Attempt ${attempt + 1}/${maxAttempts} hit rate limit, rotating to next key...`
           );
           continue;
@@ -499,7 +503,7 @@ export class Embedder {
 
       if (isContextError && this._autoChunk) {
         try {
-          console.log(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
+          logger.info(`Document exceeded context limit (${errorMsg}), attempting chunking...`);
           const chunkResult = smartChunk(text, this._model);
           
           if (chunkResult.chunks.length === 0) {
@@ -507,14 +511,14 @@ export class Embedder {
           }
 
           // Embed all chunks in parallel
-          console.log(`Split document into ${chunkResult.chunkCount} chunks for embedding`);
+          logger.info(`Split document into ${chunkResult.chunkCount} chunks for embedding`);
           const chunkEmbeddings = await Promise.all(
             chunkResult.chunks.map(async (chunk, idx) => {
               try {
                 const embedding = await this.embedSingle(chunk, task);
                 return { embedding };
               } catch (chunkError) {
-                console.warn(`Failed to embed chunk ${idx}:`, chunkError);
+                logger.warn(`Failed to embed chunk ${idx}:`, chunkError);
                 throw chunkError;
               }
             })
@@ -535,12 +539,12 @@ export class Embedder {
           
           // Cache the result for the original text (using its hash)
           this._cache.set(text, task, finalEmbedding);
-          console.log(`Successfully embedded long document as ${chunkEmbeddings.length} averaged chunks`);
+          logger.info(`Successfully embedded long document as ${chunkEmbeddings.length} averaged chunks`);
           
           return finalEmbedding;
         } catch (chunkError) {
           // If chunking fails, throw the original error
-          console.warn(`Chunking failed, using original error:`, chunkError);
+          logger.warn(`Chunking failed, using original error:`, chunkError);
           const friendly = formatEmbeddingProviderError(error, {
             baseURL: this._baseURL,
             model: this._model,
@@ -611,7 +615,7 @@ export class Embedder {
 
       if (isContextError && this._autoChunk) {
         try {
-          console.log(`Batch embedding failed with context error, attempting chunking...`);
+          logger.info(`Batch embedding failed with context error, attempting chunking...`);
           
           const chunkResults = await Promise.all(
             validTexts.map(async (text, idx) => {
@@ -644,7 +648,7 @@ export class Embedder {
             })
           );
 
-          console.log(`Successfully chunked and embedded ${chunkResults.length} long documents`);
+          logger.info(`Successfully chunked and embedded ${chunkResults.length} long documents`);
 
           // Build results array
           const results: number[][] = new Array(texts.length);

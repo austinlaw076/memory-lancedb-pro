@@ -42,7 +42,7 @@ async function testGraphRecallToolScopeAccess() {
     },
     graphitiBridge: {
       recall: async () => ({
-        groupId: "global",
+        groupIds: ["global"],
         nodes: [],
         facts: [],
       }),
@@ -72,7 +72,7 @@ async function testGraphRecallToolSuccess() {
     },
     graphitiBridge: {
       recall: async () => ({
-        groupId: "global",
+        groupIds: ["global"],
         nodes: [{ label: "Alice", score: 0.9 }],
         facts: [{ text: "Alice likes tea", score: 0.8 }],
       }),

@@ -61,9 +61,7 @@
             "description": "Enable automatic chunking for documents exceeding embedding context limits"
           }
         },
-        "required": [
-          "apiKey"
-        ]
+        "required": []
       },
       "dbPath": {
         "type": "string"
@@ -110,6 +108,16 @@
         "maximum": 20,
         "default": 3,
         "description": "Maximum number of rows injected into <relevant-memories> for each turn."
+      },
+      "autoRecallSelectionMode": {
+        "type": "string",
+        "enum": [
+          "mmr",
+          "legacy",
+          "setwise-v2"
+        ],
+        "default": "mmr",
+        "description": "Generic Auto-Recall final top-k mode. mmr keeps direct truncation after post-processing as the canonical mode; legacy is accepted as a backward-compatible alias to mmr; setwise-v2 enables set-wise final selection with higher diversity/coverage but potentially lower average per-item relevance."
       },
       "autoRecallCategories": {
         "type": "array",
@@ -760,6 +768,11 @@
     "autoRecallTopK": {
       "label": "Auto-Recall Top K",
       "help": "Maximum rows injected into <relevant-memories> each turn.",
+      "advanced": true
+    },
+    "autoRecallSelectionMode": {
+      "label": "Auto-Recall Selection Mode",
+      "help": "Generic final top-k mode: mmr is the canonical direct-truncation mode; legacy remains a backward-compatible alias to mmr; setwise-v2 enables a more diverse final selector with possible average relevance tradeoffs.",
       "advanced": true
     },
     "autoRecallCategories": {

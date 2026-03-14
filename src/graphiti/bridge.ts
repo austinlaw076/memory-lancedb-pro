@@ -58,7 +58,7 @@ export class GraphitiBridge {
   }
 
   async addEpisode(input: GraphitiEpisodeInput): Promise<GraphitiEpisodeResult> {
-    const groupId = this.resolveGroupId(input.scope);
+    const groupId = this.resolveWriteGroupId(input.scope, input.category);
     if (!this.config.enabled) {
       return { status: "skipped", groupId };
     }
@@ -116,49 +116,49 @@ export class GraphitiBridge {
   }
 
   async recall(input: GraphitiRecallInput): Promise<GraphitiRecallResult> {
-    const groupId = this.resolveGroupId(input.scope);
+    const groupIds = this.resolveReadGroupIds(input.scope);
     if (!this.config.enabled) {
-      return { groupId, nodes: [], facts: [] };
+      return { groupIds, nodes: [], facts: [] };
     }
 
     const [nodes, facts] = await Promise.all([
-      this.searchNodes(groupId, input.query, input.limitNodes),
-      this.searchFacts(groupId, input.query, input.limitFacts),
+      this.searchNodes(groupIds, input.query, input.limitNodes),
+      this.searchFacts(groupIds, input.query, input.limitFacts),
     ]);
 
     return {
-      groupId,
+      groupIds,
       nodes,
       facts,
     };
   }
 
   async list(scope: string, limitNodes: number, limitFacts: number): Promise<GraphitiRecallResult> {
-    const groupId = this.resolveGroupId(scope);
+    const groupIds = this.resolveReadGroupIds(scope);
     if (!this.config.enabled) {
-      return { groupId, nodes: [], facts: [] };
+      return { groupIds, nodes: [], facts: [] };
     }
 
     const [nodes, facts] = await Promise.all([
-      this.listNodes(groupId, limitNodes),
-      this.listFacts(groupId, limitFacts),
+      this.listNodes(groupIds, limitNodes),
+      this.listFacts(groupIds, limitFacts),
     ]);
 
     return {
-      groupId,
+      groupIds,
       nodes,
       facts,
     };
   }
 
-  private async searchNodes(groupId: string, query: string, limit: number): Promise<GraphitiNodeResult[]> {
+  private async searchNodes(groupIds: string[], query: string, limit: number): Promise<GraphitiNodeResult[]> {
     try {
       const tool = await this.pickFirstTool(SEARCH_NODES_TOOL_CANDIDATES);
       const payloads = [
-        { group_ids: [groupId], query, max_nodes: limit },
-        { group_id: groupId, query, limit },
-        { groupId, query, limit },
-        { group_id: groupId, q: query, top_k: limit },
+        { group_ids: groupIds, query, max_nodes: limit },
+        { group_id: groupIds[0], query, limit },
+        { groupId: groupIds[0], query, limit },
+        { group_id: groupIds[0], q: query, top_k: limit },
       ];
       for (const args of payloads) {
         try {
@@ -175,14 +175,14 @@ export class GraphitiBridge {
     }
   }
 
-  private async searchFacts(groupId: string, query: string, limit: number): Promise<GraphitiFactResult[]> {
+  private async searchFacts(groupIds: string[], query: string, limit: number): Promise<GraphitiFactResult[]> {
     try {
       const tool = await this.pickFirstTool(SEARCH_FACTS_TOOL_CANDIDATES);
       const payloads = [
-        { group_ids: [groupId], query, max_facts: limit },
-        { group_id: groupId, query, limit },
-        { groupId, query, limit },
-        { group_id: groupId, q: query, top_k: limit },
+        { group_ids: groupIds, query, max_facts: limit },
+        { group_id: groupIds[0], query, limit },
+        { groupId: groupIds[0], query, limit },
+        { group_id: groupIds[0], q: query, top_k: limit },
       ];
       for (const args of payloads) {
         try {
@@ -199,13 +199,13 @@ export class GraphitiBridge {
     }
   }
 
-  private async listNodes(groupId: string, limit: number): Promise<GraphitiNodeResult[]> {
+  private async listNodes(groupIds: string[], limit: number): Promise<GraphitiNodeResult[]> {
     try {
       const tool = await this.pickFirstTool(LIST_NODES_TOOL_CANDIDATES);
       const payloads = [
-        { group_ids: [groupId], max_nodes: limit },
-        { group_id: groupId, limit },
-        { groupId, limit },
+        { group_ids: groupIds, max_nodes: limit },
+        { group_id: groupIds[0], limit },
+        { groupId: groupIds[0], limit },
       ];
       for (const args of payloads) {
         try {
@@ -222,13 +222,13 @@ export class GraphitiBridge {
     }
   }
 
-  private async listFacts(groupId: string, limit: number): Promise<GraphitiFactResult[]> {
+  private async listFacts(groupIds: string[], limit: number): Promise<GraphitiFactResult[]> {
     try {
       const tool = await this.pickFirstTool(LIST_FACTS_TOOL_CANDIDATES);
       const payloads = [
-        { group_ids: [groupId], max_facts: limit },
-        { group_id: groupId, limit },
-        { groupId, limit },
+        { group_ids: groupIds, max_facts: limit },
+        { group_id: groupIds[0], limit },
+        { groupId: groupIds[0], limit },
       ];
       for (const args of payloads) {
         try {
@@ -245,7 +245,14 @@ export class GraphitiBridge {
     }
   }
 
-  private resolveGroupId(scope: string): string {
+  private resolveWriteGroupId(scope: string, category?: string): string {
+    if (this.config.groupIdMode === "routing") {
+      const cat = category || "other";
+      if (cat === "preference") return "user";
+      if (cat === "fact" || cat === "entity") return "knowledge";
+      return "agent:main";
+    }
+
     const rawGroupId = this.config.groupIdMode === "fixed"
       ? (this.config.fixedGroupId || "main")
       : scope;
@@ -257,6 +264,17 @@ export class GraphitiBridge {
       );
     }
     return sanitized;
+  }
+
+  private resolveReadGroupIds(scope: string): string[] {
+    if (this.config.groupIdMode === "routing") {
+      return ["user", "knowledge", "agent:main"];
+    }
+
+    const rawGroupId = this.config.groupIdMode === "fixed"
+      ? (this.config.fixedGroupId || "main")
+      : scope;
+    return [sanitizeGroupId(rawGroupId)];
   }
 
   private async pickFirstTool(candidates: string[]): Promise<string> {
