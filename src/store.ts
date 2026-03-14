@@ -282,12 +282,6 @@ export class MemoryStore {
     } else {
       logger.warn("FTS not supported, falling back to vector-only search");
     }
-  }
-    } else {
->>>>>>> upstream/main
-      this.ftsIndexCreated = false;
-      this.lastFtsError = "LanceDB version does not support FTS";
-    }
 
     this.db = db;
     this.table = table;
