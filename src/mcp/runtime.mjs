@@ -689,6 +689,168 @@ export async function createMemoryMcpRuntime(options = {}) {
     }
   }
 
+  async function toolSearch(args) {
+    const traceId = trace();
+    const startedAt = Date.now();
+    const query = String(args.query || "").trim();
+    const type = typeof args.type === "string" ? args.type.trim() : "";
+    const limit = clampInt(args.limit, 1, 20, 5);
+    const scope = typeof args.scope === "string" ? args.scope.trim() : undefined;
+
+    logger.info("tool_call", { traceId, tool: "search", query, type, limit, scope });
+
+    try {
+      if (!query) {
+        return {
+          content: "Search failed: query is required.",
+          structuredContent: { error: "missing_query" },
+          isError: true,
+        };
+      }
+
+      const typeFilter = type || "all";
+      if (!["all", "memory_entry", "graph_fact", "graph_node"].includes(typeFilter)) {
+        return {
+          content: `Search failed: unsupported type "${typeFilter}".`,
+          structuredContent: { error: "unsupported_type", type: typeFilter },
+          isError: true,
+        };
+      }
+
+      const scopeFilter = resolveScopeFilter(scope);
+      const results = [];
+
+      if (typeFilter === "all" || typeFilter === "memory_entry") {
+        const memories = await retriever.retrieve({
+          query,
+          limit,
+          scopeFilter,
+          source: "manual",
+        });
+        results.push(...memories.map((item) => buildMemoryEntryResult(item.entry)));
+      }
+
+      if (graphitiBridge && (typeFilter === "all" || typeFilter === "graph_fact" || typeFilter === "graph_node")) {
+        const targetScope = resolveTargetScope(scope);
+        const graph = await graphitiBridge.recall({
+          query,
+          scope: targetScope,
+          limitNodes: typeFilter === "graph_fact" ? 0 : limit,
+          limitFacts: typeFilter === "graph_node" ? 0 : limit,
+        });
+        if (typeFilter === "all" || typeFilter === "graph_node") {
+          results.push(...graph.nodes.map(buildGraphNodeResult));
+        }
+        if (typeFilter === "all" || typeFilter === "graph_fact") {
+          results.push(...graph.facts.map(buildGraphFactResult));
+        }
+      }
+
+      const trimmed = results.slice(0, limit);
+      logger.info("tool_result", {
+        traceId,
+        tool: "search",
+        count: trimmed.length,
+        latencyMs: Date.now() - startedAt,
+      });
+
+      return {
+        content: trimmed.length
+          ? `Found ${trimmed.length} retrieval results.`
+          : "No retrieval results found.",
+        structuredContent: {
+          results: trimmed,
+          nextCursor: null,
+        },
+      };
+    } catch (error) {
+      logger.error("tool_error", {
+        traceId,
+        tool: "search",
+        error,
+        latencyMs: Date.now() - startedAt,
+      });
+      return {
+        content: `Search failed: ${summarizeError(error)}`,
+        structuredContent: { error: "search_failed", message: summarizeError(error) },
+        isError: true,
+      };
+    }
+  }
+
+  async function toolFetch(args) {
+    const traceId = trace();
+    const startedAt = Date.now();
+    const rawId = String(args.id || "").trim();
+
+    logger.info("tool_call", { traceId, tool: "fetch", id: rawId });
+
+    try {
+      const parsed = parseRetrievalId(rawId);
+      if (!parsed) {
+        return {
+          content: `Fetch failed: invalid id "${rawId}".`,
+          structuredContent: { error: "invalid_id", id: rawId },
+          isError: true,
+        };
+      }
+
+      if (parsed.kind !== "entry") {
+        return {
+          content: `Fetch failed: exact ${parsed.kind} fetch is not supported in v1.`,
+          structuredContent: { error: "unsupported_source", id: rawId, kind: parsed.kind },
+          isError: true,
+        };
+      }
+
+      const entry = await store.getById(parsed.value);
+      if (!entry) {
+        return {
+          content: `Fetch failed: memory ${parsed.value} not found.`,
+          structuredContent: { error: "not_found", id: rawId },
+          isError: true,
+        };
+      }
+
+      if (accessMode === "scoped") {
+        const allowedScopes = resolveScopeFilter();
+        if (allowedScopes && !allowedScopes.includes(entry.scope)) {
+          return {
+            content: `Fetch failed: memory ${parsed.value} not found.`,
+            structuredContent: { error: "not_found", id: rawId },
+            isError: true,
+          };
+        }
+      }
+
+      const result = buildMemoryFetchResult(entry);
+      logger.info("tool_result", {
+        traceId,
+        tool: "fetch",
+        kind: parsed.kind,
+        memoryId: parsed.value,
+        latencyMs: Date.now() - startedAt,
+      });
+
+      return {
+        content: `Fetched ${result.type} ${result.id}.`,
+        structuredContent: { result },
+      };
+    } catch (error) {
+      logger.error("tool_error", {
+        traceId,
+        tool: "fetch",
+        error,
+        latencyMs: Date.now() - startedAt,
+      });
+      return {
+        content: `Fetch failed: ${summarizeError(error)}`,
+        structuredContent: { error: "fetch_failed", message: summarizeError(error) },
+        isError: true,
+      };
+    }
+  }
+
   return {
     store,
     retriever,
@@ -706,6 +868,8 @@ export async function createMemoryMcpRuntime(options = {}) {
     toolUpdate,
     toolForget,
     toolGraphRecall,
+    toolSearch,
+    toolFetch,
   };
 }
 
@@ -763,6 +927,90 @@ function sanitizeRetrievalResult(result) {
     entry: sanitizeMemoryEntry(result.entry),
     sources: result.sources,
   };
+}
+
+function compactObject(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
+}
+
+function buildMemoryEntryResult(entry) {
+  return {
+    id: `memory:entry:${entry.id}`,
+    title: `${entry.category} / ${entry.scope}`,
+    text: entry.text,
+    url: null,
+    type: "memory_entry",
+    source: "memory",
+    metadata: {
+      category: entry.category,
+      scope: entry.scope,
+      importance: entry.importance,
+      timestamp: entry.timestamp,
+    },
+  };
+}
+
+function buildGraphFactResult(fact) {
+  return {
+    id: `memory:fact:${fact.id ?? "unavailable"}`,
+    title: "graph_fact",
+    text: fact.text,
+    url: null,
+    type: "graph_fact",
+    source: "memory",
+    metadata: compactObject({
+      score: fact.score,
+      raw: fact.raw,
+      graphFetchSupported: false,
+    }),
+  };
+}
+
+function buildGraphNodeResult(node) {
+  return {
+    id: `memory:node:${node.id ?? "unavailable"}`,
+    title: node.label,
+    text: node.label,
+    url: null,
+    type: "graph_node",
+    source: "memory",
+    metadata: compactObject({
+      score: node.score,
+      raw: node.raw,
+      graphFetchSupported: false,
+    }),
+  };
+}
+
+function buildMemoryFetchResult(entry) {
+  return {
+    id: `memory:entry:${entry.id}`,
+    title: `${entry.category} / ${entry.scope}`,
+    content: entry.text,
+    url: null,
+    type: "memory_entry",
+    source: "memory",
+    metadata: {
+      category: entry.category,
+      scope: entry.scope,
+      importance: entry.importance,
+      timestamp: entry.timestamp,
+      metadata: safeParseJson(entry.metadata),
+    },
+  };
+}
+
+function parseRetrievalId(raw) {
+  if (!raw.startsWith("memory:")) return null;
+  const parts = raw.split(":");
+  if (parts.length < 3) return null;
+  const [, kind, ...rest] = parts;
+  const value = rest.join(":").trim();
+  if (!value) return null;
+  if (kind === "entry" || kind === "fact" || kind === "node") {
+    return { kind, value };
+  }
+  return null;
 }
 
 function extractPluginConfig(configPath, pluginEntryName) {

@@ -1,0 +1,250 @@
+{
+  "timestamp": "2026-03-03T05:06:26.048Z",
+  "environment": {
+    "node": "v25.6.1",
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "config": {
+    "baseUrl": "http://127.0.0.1:8001",
+    "timeoutMs": 10000,
+    "scope": "global",
+    "query": "scope/global mapping",
+    "iterations": 20,
+    "concurrency": 2,
+    "warmup": 2,
+    "settleMs": 120,
+    "tokenProvided": true,
+    "tokenFrom": "GRAPHITI_API_TOKEN"
+  },
+  "probe": {
+    "health": {
+      "ok": true,
+      "details": [
+        {
+          "url": "http://127.0.0.1:8001/health",
+          "ok": true,
+          "status": 200,
+          "latencyMs": 46,
+          "bodySnippet": "{\"status\":\"healthy\",\"service\":\"graphiti-mcp\"}"
+        }
+      ]
+    },
+    "tools": {
+      "ok": true,
+      "toolNames": [
+        "add_memory",
+        "search_nodes",
+        "search_memory_facts",
+        "delete_entity_edge",
+        "delete_episode",
+        "get_entity_edge",
+        "get_episodes",
+        "clear_graph",
+        "get_status"
+      ],
+      "toolCount": 9
+    }
+  },
+  "toolResolution": {
+    "addEpisodeTool": "add_memory",
+    "searchFactsTool": "search_memory_facts",
+    "searchNodesTool": "search_nodes"
+  },
+  "warmup": {
+    "count": 2,
+    "passed": 2,
+    "failed": 0
+  },
+  "workload": {
+    "totalCases": 20,
+    "successCases": 20,
+    "failedCases": 0,
+    "errorRate": 0,
+    "addLatencyMs": [
+      12,
+      12,
+      5,
+      61,
+      5,
+      67,
+      6,
+      6,
+      5,
+      10,
+      11,
+      6,
+      5,
+      6,
+      5,
+      8,
+      5,
+      8,
+      5,
+      5
+    ],
+    "searchFactsLatencyMs": [
+      166,
+      873,
+      397,
+      216,
+      206,
+      183,
+      233,
+      201,
+      292,
+      152,
+      214,
+      160,
+      174,
+      231,
+      264,
+      228,
+      261,
+      260,
+      164,
+      252
+    ],
+    "searchNodesLatencyMs": [
+      184,
+      170,
+      231,
+      154,
+      227,
+      222,
+      267,
+      306,
+      314,
+      304,
+      334,
+      165,
+      261,
+      237,
+      192,
+      222,
+      195,
+      193,
+      162,
+      169
+    ],
+    "caseLatencyMs": [
+      484,
+      1177,
+      753,
+      553,
+      559,
+      595,
+      627,
+      633,
+      732,
+      588,
+      682,
+      452,
+      561,
+      594,
+      584,
+      579,
+      582,
+      582,
+      451,
+      547
+    ],
+    "sampleFailures": [],
+    "sampleSuccesses": [
+      {
+        "index": 1,
+        "ok": true,
+        "addLatencyMs": 12,
+        "searchFactsLatencyMs": 166,
+        "searchNodesLatencyMs": 184,
+        "caseLatencyMs": 484,
+        "factsCount": 0,
+        "nodesCount": 0
+      },
+      {
+        "index": 2,
+        "ok": true,
+        "addLatencyMs": 12,
+        "searchFactsLatencyMs": 873,
+        "searchNodesLatencyMs": 170,
+        "caseLatencyMs": 1177,
+        "factsCount": 0,
+        "nodesCount": 0
+      },
+      {
+        "index": 3,
+        "ok": true,
+        "addLatencyMs": 5,
+        "searchFactsLatencyMs": 397,
+        "searchNodesLatencyMs": 231,
+        "caseLatencyMs": 753,
+        "factsCount": 0,
+        "nodesCount": 0
+      },
+      {
+        "index": 4,
+        "ok": true,
+        "addLatencyMs": 61,
+        "searchFactsLatencyMs": 216,
+        "searchNodesLatencyMs": 154,
+        "caseLatencyMs": 553,
+        "factsCount": 0,
+        "nodesCount": 0
+      },
+      {
+        "index": 5,
+        "ok": true,
+        "addLatencyMs": 5,
+        "searchFactsLatencyMs": 206,
+        "searchNodesLatencyMs": 227,
+        "caseLatencyMs": 559,
+        "factsCount": 0,
+        "nodesCount": 0
+      }
+    ],
+    "stats": {
+      "add": {
+        "count": 20,
+        "min": 5,
+        "avg": 12.65,
+        "p50": 6,
+        "p95": 61,
+        "p99": 67,
+        "max": 67
+      },
+      "searchFacts": {
+        "count": 20,
+        "min": 152,
+        "avg": 256.35,
+        "p50": 216,
+        "p95": 397,
+        "p99": 873,
+        "max": 873
+      },
+      "searchNodes": {
+        "count": 20,
+        "min": 154,
+        "avg": 225.45,
+        "p50": 222,
+        "p95": 314,
+        "p99": 334,
+        "max": 334
+      },
+      "caseTotal": {
+        "count": 20,
+        "min": 451,
+        "avg": 615.75,
+        "p50": 582,
+        "p95": 753,
+        "p99": 1177,
+        "max": 1177
+      }
+    }
+  },
+  "summary": {
+    "status": "pass",
+    "notes": [
+      "All benchmark cases passed."
+    ]
+  }
+}

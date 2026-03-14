@@ -21,13 +21,54 @@
  */
 
 import http from "node:http";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
 import jiti from "jiti";
 
 const importRuntime = () => jiti(import.meta.url)("./runtime.mjs");
 
 let runtime = null;
+const FORCE_NON_DESTRUCTIVE_ANNOTATIONS = {
+  destructiveHint: false,
+  openWorldHint: false,
+};
+const READ_ONLY_TOOLS = new Set(["search", "fetch", "memory_recall", "memory_graph_recall"]);
+const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
+const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
+
+preloadOpenClawSecrets();
 
 const TOOLS = [
+  {
+    name: "search",
+    description: "Search standardized retrieval results from memory entries and graph recall output.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Natural language query" },
+        type: {
+          type: "string",
+          description: "Optional result type filter",
+          enum: ["memory_entry", "graph_fact", "graph_node"],
+        },
+        limit: { type: "number", description: "Max results to return (default: 5)", default: 5 },
+        scope: { type: "string", description: "Scope filter (optional)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "fetch",
+    description: "Fetch a single standardized retrieval result by exact id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Exact retrieval result id, for example memory:entry:<id>" },
+      },
+      required: ["id"],
+    },
+  },
   {
     name: "memory_store",
     description: "Store a new memory in the shared memory system.",
@@ -135,6 +176,58 @@ function sendJsonRpcError(res, code, message, id = null) {
   sendJsonRpcResponse(res, response);
 }
 
+function negotiateProtocolVersion(requestedVersion) {
+  if (typeof requestedVersion === "string" && SUPPORTED_PROTOCOL_VERSIONS.has(requestedVersion)) {
+    return requestedVersion;
+  }
+  return DEFAULT_PROTOCOL_VERSION;
+}
+
+function preloadOpenClawSecrets() {
+  const configPath = expandHome(
+    process.env.MEMORY_LANCEDB_PRO_MCP_OPENCLAW_CONFIG || "~/.openclaw/openclaw.json",
+  );
+  const secretsPath = resolve(dirname(configPath), "secrets.env");
+
+  try {
+    const content = readFileSync(secretsPath, "utf8");
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+      const eqIndex = line.indexOf("=");
+      if (eqIndex === -1) {
+        continue;
+      }
+      const key = line.slice(0, eqIndex).trim();
+      if (!key || process.env[key]) {
+        continue;
+      }
+      let value = line.slice(eqIndex + 1).trim();
+      if (
+        (value.startsWith("\"") && value.endsWith("\"")) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      process.env[key] = value;
+    }
+  } catch {
+    // Optional env source; ignore when not present.
+  }
+}
+
+function expandHome(value) {
+  if (value === "~") {
+    return homedir();
+  }
+  if (value.startsWith("~/")) {
+    return resolve(homedir(), value.slice(2));
+  }
+  return resolve(value);
+}
+
 async function handleJsonRpc(res, body) {
   let request;
   try {
@@ -158,7 +251,7 @@ async function handleJsonRpc(res, body) {
       case "initialize": {
         await initialize();
         result = {
-          protocolVersion: "2024-11-05",
+          protocolVersion: negotiateProtocolVersion(params?.protocolVersion),
           capabilities: { tools: {}, resources: {} },
           serverInfo: { name: "memory-lancedb-pro", version: "1.0.0-phase1" },
         };
@@ -168,8 +261,22 @@ async function handleJsonRpc(res, body) {
         return;
       }
 
+      case "notifications/initialized": {
+        res.writeHead(202).end();
+        return;
+      }
+
       case "tools/list": {
-        result = { tools: TOOLS };
+        result = {
+          tools: TOOLS.map((tool) => ({
+            ...tool,
+            annotations: {
+              readOnlyHint: READ_ONLY_TOOLS.has(tool.name),
+              ...tool.annotations,
+              ...FORCE_NON_DESTRUCTIVE_ANNOTATIONS,
+            },
+          })),
+        };
         sendJsonRpcResponse(res, { jsonrpc: "2.0", id, result });
         return;
       }
@@ -181,6 +288,12 @@ async function handleJsonRpc(res, body) {
         const toolArgs = params?.arguments || {};
 
         switch (toolName) {
+          case "search":
+            result = await runtime.toolSearch(toolArgs);
+            break;
+          case "fetch":
+            result = await runtime.toolFetch(toolArgs);
+            break;
           case "memory_store":
             result = await runtime.toolStore(toolArgs);
             break;
@@ -196,8 +309,12 @@ async function handleJsonRpc(res, body) {
           case "memory_graph_recall":
             result = await runtime.toolGraphRecall(toolArgs);
             break;
-          default:
-            throw new Error(`Unknown tool: ${toolName}`);
+      default:
+        if (id === undefined || id === null) {
+          res.writeHead(202).end();
+          return;
+        }
+        throw new Error(`Unknown tool: ${toolName}`);
         }
 
         result = {

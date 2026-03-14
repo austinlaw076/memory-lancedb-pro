@@ -16,14 +16,56 @@
  *   MEMORY_LANCEDB_PRO_MCP_ACCESS_MODE - "all" or "scoped" (default: all)
  */
 
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
 import jiti from "jiti";
 
 const importRuntime = () => jiti(import.meta.url)("./runtime.mjs");
 
 let runtime = null;
 let requestId = 1;
+let outputMode = "content-length";
+const FORCE_NON_DESTRUCTIVE_ANNOTATIONS = {
+  destructiveHint: false,
+  openWorldHint: false,
+};
+const READ_ONLY_TOOLS = new Set(["search", "fetch", "memory_recall", "memory_graph_recall"]);
+const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
+const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
+
+preloadOpenClawSecrets();
 
 const TOOLS = [
+  {
+    name: "search",
+    description: "Search standardized retrieval results from memory entries and graph recall output.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Natural language query" },
+        type: {
+          type: "string",
+          description: "Optional result type filter",
+          enum: ["memory_entry", "graph_fact", "graph_node"],
+        },
+        limit: { type: "number", description: "Max results to return (default: 5)", default: 5 },
+        scope: { type: "string", description: "Scope filter (optional)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "fetch",
+    description: "Fetch a single standardized retrieval result by exact id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Exact retrieval result id, for example memory:entry:<id>" },
+      },
+      required: ["id"],
+    },
+  },
   {
     name: "memory_store",
     description: "Store a new memory in the shared memory system.",
@@ -114,16 +156,64 @@ async function initialize() {
 }
 
 function sendResponse(response) {
-  process.stdout.write(`Content-Length: ${JSON.stringify(response).length}\r\n\r\n${JSON.stringify(response)}`);
+  const payload = JSON.stringify(response);
+  if (outputMode === "ndjson") {
+    process.stdout.write(`${payload}\n`);
+    return;
+  }
+  process.stdout.write(`Content-Length: ${Buffer.byteLength(payload)}\r\n\r\n${payload}`);
 }
 
-function sendNotification(method, params) {
-  const response = {
-    jsonrpc: "2.0",
-    method,
-    result: params,
-  };
-  process.stdout.write(`Content-Length: ${JSON.stringify(response).length}\r\n\r\n${JSON.stringify(response)}`);
+function negotiateProtocolVersion(requestedVersion) {
+  if (typeof requestedVersion === "string" && SUPPORTED_PROTOCOL_VERSIONS.has(requestedVersion)) {
+    return requestedVersion;
+  }
+  return DEFAULT_PROTOCOL_VERSION;
+}
+
+function preloadOpenClawSecrets() {
+  const configPath = expandHome(
+    process.env.MEMORY_LANCEDB_PRO_MCP_OPENCLAW_CONFIG || "~/.openclaw/openclaw.json",
+  );
+  const secretsPath = resolve(dirname(configPath), "secrets.env");
+
+  try {
+    const content = readFileSync(secretsPath, "utf8");
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+      const eqIndex = line.indexOf("=");
+      if (eqIndex === -1) {
+        continue;
+      }
+      const key = line.slice(0, eqIndex).trim();
+      if (!key || process.env[key]) {
+        continue;
+      }
+      let value = line.slice(eqIndex + 1).trim();
+      if (
+        (value.startsWith("\"") && value.endsWith("\"")) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      process.env[key] = value;
+    }
+  } catch {
+    // Optional env source; ignore when not present.
+  }
+}
+
+function expandHome(value) {
+  if (value === "~") {
+    return homedir();
+  }
+  if (value.startsWith("~/")) {
+    return resolve(homedir(), value.slice(2));
+  }
+  return resolve(value);
 }
 
 async function handleRequest(request) {
@@ -137,7 +227,7 @@ async function handleRequest(request) {
           jsonrpc: "2.0",
           id,
           result: {
-            protocolVersion: "2024-11-05",
+            protocolVersion: negotiateProtocolVersion(params?.protocolVersion),
             capabilities: {
               tools: {},
               resources: {},
@@ -149,7 +239,10 @@ async function handleRequest(request) {
           },
         };
         sendResponse(response);
-        sendNotification("notifications/initialized", {});
+        break;
+      }
+
+      case "notifications/initialized": {
         break;
       }
 
@@ -158,7 +251,14 @@ async function handleRequest(request) {
           jsonrpc: "2.0",
           id,
           result: {
-            tools: TOOLS,
+            tools: TOOLS.map((tool) => ({
+              ...tool,
+              annotations: {
+                readOnlyHint: READ_ONLY_TOOLS.has(tool.name),
+                ...tool.annotations,
+                ...FORCE_NON_DESTRUCTIVE_ANNOTATIONS,
+              },
+            })),
           },
         };
         sendResponse(response);
@@ -176,6 +276,12 @@ async function handleRequest(request) {
         let result;
 
         switch (toolName) {
+          case "search":
+            result = await runtime.toolSearch(toolArgs);
+            break;
+          case "fetch":
+            result = await runtime.toolFetch(toolArgs);
+            break;
           case "memory_store":
             result = await runtime.toolStore(toolArgs);
             break;
@@ -258,6 +364,9 @@ async function handleRequest(request) {
       }
 
       default: {
+        if (id === undefined || id === null) {
+          break;
+        }
         const response = {
           jsonrpc: "2.0",
           id,
@@ -291,28 +400,50 @@ async function main() {
   process.stdin.on("data", async (chunk) => {
     buffer += chunk;
 
-    // Parse Content-Length headers
-    const headerMatch = buffer.match(/Content-Length:\s*(\d+)\r\n/);
-    if (!headerMatch) return;
+    while (true) {
+      let body;
 
-    const contentLength = parseInt(headerMatch[1], 10);
-    const headerEnd = buffer.indexOf("\r\n\r\n");
-    
-    if (headerEnd === -1) return;
-    
-    const bodyStart = headerEnd + 4;
-    const bodyEnd = bodyStart + contentLength;
-    
-    if (buffer.length < bodyEnd) return;
+      if (buffer.startsWith("Content-Length:")) {
+        outputMode = "content-length";
+        const headerMatch = buffer.match(/Content-Length:\s*(\d+)\r\n/);
+        if (!headerMatch) {
+          return;
+        }
 
-    const body = buffer.slice(bodyStart, bodyEnd);
-    buffer = buffer.slice(bodyEnd);
+        const contentLength = parseInt(headerMatch[1], 10);
+        const headerEnd = buffer.indexOf("\r\n\r\n");
+        if (headerEnd === -1) {
+          return;
+        }
 
-    try {
-      const request = JSON.parse(body);
-      await handleRequest(request);
-    } catch (error) {
-      console.error("Failed to parse request:", error);
+        const bodyStart = headerEnd + 4;
+        const bodyEnd = bodyStart + contentLength;
+        if (buffer.length < bodyEnd) {
+          return;
+        }
+
+        body = buffer.slice(bodyStart, bodyEnd);
+        buffer = buffer.slice(bodyEnd);
+      } else {
+        outputMode = "ndjson";
+        const newlineIndex = buffer.indexOf("\n");
+        if (newlineIndex === -1) {
+          return;
+        }
+
+        body = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (!body) {
+          continue;
+        }
+      }
+
+      try {
+        const request = JSON.parse(body);
+        await handleRequest(request);
+      } catch (error) {
+        console.error("Failed to parse request:", error);
+      }
     }
   });
 

@@ -1,0 +1,73 @@
+{
+  "timestamp": "2026-03-03T04:26:25.157Z",
+  "environment": {
+    "node": "v22.22.0",
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "config": {
+    "baseUrl": "http://127.0.0.1:8000",
+    "hasToken": true,
+    "timeoutMs": 5000,
+    "scope": "global",
+    "query": "project timeline and owner preferences"
+  },
+  "steps": [
+    {
+      "name": "health_probe",
+      "ok": false,
+      "details": [
+        {
+          "url": "http://127.0.0.1:8000/health",
+          "ok": false,
+          "status": 404,
+          "bodySnippet": "Not Found",
+          "latencyMs": 41
+        },
+        {
+          "url": "http://127.0.0.1:8000/api/health",
+          "ok": false,
+          "status": 404,
+          "bodySnippet": "Not Found",
+          "latencyMs": 3
+        },
+        {
+          "url": "http://127.0.0.1:8000/status",
+          "ok": false,
+          "status": 404,
+          "bodySnippet": "Not Found",
+          "latencyMs": 2
+        }
+      ],
+      "warning": "No health endpoint returned 2xx. This may be acceptable if /mcp is reachable."
+    },
+    {
+      "name": "mcp_tools_list",
+      "ok": false,
+      "attempts": [
+        {
+          "url": "http://127.0.0.1:8000/mcp",
+          "ok": false,
+          "status": 400,
+          "authRequired": false,
+          "latencyMs": 7,
+          "bodySnippet": "{\"jsonrpc\":\"2.0\",\"id\":\"server-error\",\"error\":{\"code\":-32600,\"message\":\"Bad Request: Missing session ID\"}}"
+        },
+        {
+          "url": "http://127.0.0.1:8000/mcp/",
+          "ok": false,
+          "status": 400,
+          "authRequired": false,
+          "latencyMs": 7,
+          "bodySnippet": "{\"jsonrpc\":\"2.0\",\"id\":\"server-error\",\"error\":{\"code\":-32600,\"message\":\"Bad Request: Missing session ID\"}}"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "status": "fail",
+    "notes": [
+      "Unable to list MCP tools from Graphiti endpoint."
+    ]
+  }
+}

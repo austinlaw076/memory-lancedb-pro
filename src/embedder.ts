@@ -86,8 +86,9 @@ class EmbeddingCache {
 
 export interface EmbeddingConfig {
   provider: "openai-compatible";
-  /** Single API key or array of keys for round-robin rotation with failover. */
-  apiKey: string | string[];
+  /** Single API key or array of keys for round-robin rotation with failover.
+   *  Optional for local providers like Ollama that do not require authentication. */
+  apiKey?: string | string[];
   model: string;
   baseURL?: string;
   dimensions?: number;
@@ -296,8 +297,10 @@ export class Embedder {
   private readonly _autoChunk: boolean;
 
   constructor(config: EmbeddingConfig & { chunking?: boolean }) {
-    // Normalize apiKey to array and resolve environment variables
-    const apiKeys = Array.isArray(config.apiKey) ? config.apiKey : [config.apiKey];
+    // Normalize apiKey to array and resolve environment variables.
+    // Fall back to a dummy key for local providers (e.g. Ollama) that don't require auth.
+    const rawKey = config.apiKey ?? "no-key-required";
+    const apiKeys = Array.isArray(rawKey) ? rawKey : [rawKey];
     const resolvedKeys = apiKeys.map(k => resolveEnvVars(k));
 
     this._model = config.model;

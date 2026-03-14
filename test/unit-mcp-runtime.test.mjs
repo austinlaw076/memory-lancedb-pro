@@ -48,6 +48,9 @@ test("memory MCP runtime initializes from temp config and fails closed on disabl
         apiKey: "test-api-key",
       },
       dbPath,
+      accessTracking: {
+        enabled: false,
+      },
       graphiti: {
         enabled: false,
       },
@@ -74,6 +77,94 @@ test("memory MCP runtime initializes from temp config and fails closed on disabl
     const missingRecall = await runtime.toolRecall({});
     assert.equal(missingRecall.isError, true);
     assert.deepEqual(missingRecall.structuredContent, { error: "missing_query" });
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("memory MCP runtime search/fetch returns normalized memory results", async () => {
+  const rootDir = mkdtempSync(path.join(tmpdir(), "memory-lancedb-pro-mcp-search-fetch-"));
+
+  try {
+    const dbPath = path.join(rootDir, "db");
+    const configPath = writeOpenClawConfig(rootDir, {
+      embedding: {
+        apiKey: "test-api-key",
+      },
+      dbPath,
+      accessTracking: {
+        enabled: false,
+      },
+      graphiti: {
+        enabled: false,
+      },
+    });
+
+    const runtime = await createMemoryMcpRuntime({
+      openclawConfigPath: configPath,
+      defaultScope: "global",
+      accessMode: "all",
+    });
+
+    const dims = runtime.embedder.dimensions;
+    runtime.embedder.embedPassage = async () => new Array(dims).fill(0.1);
+    runtime.embedder.embedQuery = async () => new Array(dims).fill(0.1);
+
+    const stored = await runtime.toolStore({
+      text: "User preference: prefers Traditional Chinese output.",
+      category: "preference",
+      scope: "global",
+    });
+    assert.equal(stored.isError, undefined);
+    const memoryId = stored.structuredContent.memory.id;
+
+    const search = await runtime.toolSearch({ query: "Traditional Chinese", limit: 3 });
+    assert.equal(search.isError, undefined);
+    assert.equal(search.structuredContent.results.length, 1);
+    assert.deepEqual(search.structuredContent.results[0], {
+      id: `memory:entry:${memoryId}`,
+      title: "preference / global",
+      text: "User preference: prefers Traditional Chinese output.",
+      url: null,
+      type: "memory_entry",
+      source: "memory",
+      metadata: {
+        category: "preference",
+        scope: "global",
+        importance: 0.7,
+        timestamp: search.structuredContent.results[0].metadata.timestamp,
+      },
+    });
+
+    const fetched = await runtime.toolFetch({ id: `memory:entry:${memoryId}` });
+    assert.equal(fetched.isError, undefined);
+    assert.deepEqual(fetched.structuredContent.result, {
+      id: `memory:entry:${memoryId}`,
+      title: "preference / global",
+      content: "User preference: prefers Traditional Chinese output.",
+      url: null,
+      type: "memory_entry",
+      source: "memory",
+      metadata: {
+        category: "preference",
+        scope: "global",
+        importance: 0.7,
+        timestamp: fetched.structuredContent.result.metadata.timestamp,
+        metadata: {},
+      },
+    });
+
+    const invalid = await runtime.toolFetch({ id: "bad-id" });
+    assert.equal(invalid.isError, true);
+    assert.deepEqual(invalid.structuredContent, { error: "invalid_id", id: "bad-id" });
+
+    const unsupportedGraph = await runtime.toolFetch({ id: "memory:fact:abc" });
+    assert.equal(unsupportedGraph.isError, true);
+    assert.deepEqual(unsupportedGraph.structuredContent, {
+      error: "unsupported_source",
+      id: "memory:fact:abc",
+      kind: "fact",
+    });
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
